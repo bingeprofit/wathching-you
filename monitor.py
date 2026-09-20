@@ -82,8 +82,19 @@ MINX = {1: "0", 2: "1", 3: "2", 5: "3", 10: "4", 15: "5", 20: "6", 30: "7", 60: 
 US_DEFAULT_WATCH = (
     "SPY,QQQ,IWM,DIA,TLT,HYG,GLD,SLV,USO,UNG,XLE,XLK,XLV,XLF,XLI,XLY,XLP,XLU,XLB,"
     "SMH,SOXX,ARKK,"
+    # 유료 CME 선물을 대신하는 무료 대용물. 선물만큼 정밀하진 않아도
+    # "오늘 이 원자재가 크게 움직였다"는 신호로는 충분하다.
+    "CPER,CORN,WEAT,SOYB,DBA,IEF,UUP,"
     "AAPL,MSFT,NVDA,GOOGL,AMZN,META,AVGO,TSLA,LLY,JPM,V,MA,XOM,UNH,COST,WMT,NFLX,"
-    "AMD,MU,INTC,QCOM,TSM,ASML,AMAT,LRCX,KLAC,ARM,SMCI,PLTR,COIN,MSTR"
+    "AMD,MU,INTC,QCOM,TSM,ASML,AMAT,LRCX,KLAC,ARM,SMCI,PLTR,COIN,MSTR,"
+    # 메모리 — 커버리지 핵심. 낸드·HDD 까지 함께 본다
+    "SNDK,STX,WDC,"
+    # 네트워크·광통신·아날로그
+    "MRVL,ANET,LITE,CIEN,TSEM,SMTC,SWKS,"
+    # 소프트웨어·보안
+    "CRM,SNOW,U,DOCU,OKTA,TEAM,NTNX,CRWD,PANW,"
+    # 헬스케어
+    "JNJ,MRK,ABBV,NVS,MRNA,NTRA,HUM,HALO,ROIV,RVMD,IQV,AVTR,CORT,PSNL"
 )
 
 SYSTEM = """당신은 장중 급등락 원인을 즉시 파악해 트레이더에게 보고하는 분석가다.
@@ -346,11 +357,23 @@ def watchlist(market: str) -> list[str]:
 
 # ── 해외선물 ─────────────────────────────────────────────────────────────
 # 선물은 순위 API 가 없다. 볼 품목을 정해 두고 근월물을 매일 자동으로 찾는다.
-FUT_DEFAULT_ROOTS = "ES,NQ,CL,NG,GC,SI,HG,ZC,ZS,ZW,ZN,6E,6J"
-FUT_LABEL = {"ES": "S&P500", "NQ": "나스닥100", "CL": "WTI원유", "NG": "천연가스",
-             "GC": "금", "SI": "은", "HG": "구리", "ZC": "옥수수", "ZS": "대두",
-             "ZW": "밀", "ZN": "미국10년물", "ZB": "미국30년물", "6E": "유로",
-             "6J": "엔", "6A": "호주달러", "RB": "휘발유", "HO": "난방유"}
+# CME 계열(ES·NQ·CL·GC·ZC …)은 서브거래소마다 월 $228.8 — 네 곳 다 쓰면 월 $915 다.
+# 이 모니터가 쓸 만한 금액이 아니라서 **시세료 0원인 ICE 거래소 품목만** 기본으로 둔다.
+# 빠지는 것(지수·금리·곡물·구리·천연가스)은 미국 ETF 로 대신 본다 — 해외주식 시세는 무료다.
+# CME 를 신청하셨다면 FUT_ROOTS 에 ES,NQ,ZN 처럼 넣으면 그대로 동작한다.
+FUT_DEFAULT_ROOTS = "DX,BRN,WBS,MEM,SB,KC,CC"
+FUT_LABEL = {
+    # ICE — 시세료 0원
+    "DX": "달러인덱스", "BRN": "브렌트유", "WBS": "WTI원유", "GAS": "가스오일",
+    "MEM": "MSCI신흥국", "FTS": "FTSE100", "SB": "설탕", "KC": "커피", "CC": "코코아",
+    "CT": "면화", "OJ": "오렌지주스", "YG": "미니금", "YS": "미니은", "LG": "영국국채",
+    # CME 계열 — 유료 신청 시에만
+    "ES": "S&P500", "NQ": "나스닥100", "RTY": "러셀2000", "YM": "다우",
+    "CL": "WTI원유", "NG": "천연가스", "RB": "휘발유", "HO": "난방유", "BZ": "브렌트",
+    "GC": "금", "SI": "은", "HG": "구리", "PL": "백금", "PD": "팔라듐",
+    "ZC": "옥수수", "ZS": "대두", "ZW": "밀", "ZL": "대두유", "ZM": "대두박",
+    "ZN": "미국10년물", "ZB": "미국30년물", "ZF": "미국5년물", "ZT": "미국2년물",
+    "6E": "유로", "6J": "엔", "6A": "호주달러", "6B": "파운드", "KRW": "원화"}
 MONTH_CODE = "FGHJKMNQUVXZ"          # 1~12월 선물 월물코드
 
 

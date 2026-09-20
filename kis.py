@@ -53,7 +53,8 @@ class KIS:
         self.log = log
         # 실전 한도는 문서상 초당 20건이지만 실제로는 더 빡빡하다 (EGW00201).
         # 초당 ~8건에서 시작해, 걸릴 때마다 _get 이 스스로 간격을 늘린다.
-        self.min_gap = min_gap
+        self.min_gap = self.base_gap = min_gap
+        self._ok_streak = 0              # 연속 성공 횟수 (간격을 다시 줄이는 근거)
         self._tok, self._exp = None, 0.0
         self._last_call, self._lock = 0.0, threading.Lock()
         self._seen_err: set = set()      # 같은 오류를 매 분 찍지 않기 위해
@@ -137,6 +138,7 @@ class KIS:
             if code == "EGW00201" and _retry < 3:
                 with self._lock:
                     self.min_gap = min(round(self.min_gap * 1.6, 3), 0.4)
+                self._ok_streak = 0
                 self._log_once(("rate", self.min_gap),
                                f"KIS 유량 초과 → 호출 간격 {self.min_gap:.2f}초로 늘리고 재시도")
                 time.sleep(0.3 * (_retry + 1))
@@ -145,6 +147,18 @@ class KIS:
                 (tr_id, r.status_code, code),
                 f"KIS 오류 [{tr_id}] HTTP {r.status_code} {code}: "
                 f"{str(j.get('msg1') or r.text)[:160]}")
+            return j
+        # 잘 나가고 있으면 간격을 조금씩 되돌린다. 한 번 걸렸다고 그 뒤로 계속
+        # 최악의 속도로 도는 것은 낭비다 — 종목 200개면 스캔 한 번이 80초가 되어
+        # 60초 루프를 넘겨 버린다. 실제로 견디는 속도를 찾아가게 한다.
+        if self.min_gap > self.base_gap:
+            with self._lock:
+                self._ok_streak += 1
+                if self._ok_streak >= 80:
+                    self._ok_streak = 0
+                    self.min_gap = max(round(self.min_gap * 0.85, 3), self.base_gap)
+                    self._log_once(("ease", self.min_gap),
+                                   f"KIS 안정적 → 호출 간격 {self.min_gap:.2f}초로 되돌림")
         return j
 
     def _log_once(self, sig, msg: str):
