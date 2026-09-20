@@ -380,14 +380,23 @@ def fut_symbols(api) -> dict[str, dict]:
     if c.get("date") == today and prev:
         return prev
     out, roll = {}, []
-    for root in watchlist("fut"):
-        for sym in fut_candidates(root):
+    roots = watchlist("fut")
+    for n, root in enumerate(roots):
+        cands = fut_candidates(root)
+        for sym in cands:
             q = api.fut_price(sym)
             if q and q.get("remain_days", 0) >= CFG["FUT_ROLL_DAYS"]:
                 out[root] = {"symbol": sym, "exch": q.get("exch") or "CME"}
                 if prev.get(root, {}).get("symbol") not in (None, sym):
                     roll.append(root)
                 break
+        # 첫 품목이 한 달도 안 잡히면 나머지 12개를 더 두드려 봐야 결과는 같다.
+        # 180번을 헛돌며 2분을 쓰는 대신, 바로 멈추고 원인을 물어본다.
+        if n == 0 and not out:
+            log(f"'{root}' 근월물을 하나도 못 찾았습니다 — 나머지 품목 조회를 건너뛰고 원인을 확인합니다")
+            probe = cands[:4] + (fut_candidates(roots[1])[:4] if len(roots) > 1 else [])
+            api.fut_probe(probe)
+            return {}
     for root in roll:                  # 롤오버된 품목은 이력·참조데이터를 초기화
         _HIST.pop(f"fut:{root}", None)
         _REF.pop(f"fut:{root}", None)

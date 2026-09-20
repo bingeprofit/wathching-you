@@ -106,20 +106,36 @@ class KIS:
             self._last_call = time.time()
 
     def _get(self, path: str, tr_id: str, params: dict, timeout: int = 15) -> dict:
+        """실패해도 예외를 던지지 않고 빈 dict 를 돌려준다. 대신 **무슨 일이 있었는지
+        반드시 한 번은 로그로 남긴다.** 예외로 던지면 호출부의 try/except 가 삼켜서
+        '아무것도 못 찾음'만 남고 원인을 알 수 없게 된다."""
         self._throttle()
         h = {"authorization": f"Bearer {self.token()}", "appkey": self.key,
              "appsecret": self.sec, "tr_id": tr_id, "custtype": "P",
              "content-type": "application/json; charset=utf-8"}
-        r = requests.get(f"{self.base}{path}", headers=h, params=params, timeout=timeout)
-        r.raise_for_status()
-        j = r.json()
-        # KIS 는 오류도 HTTP 200 + rt_cd 로 돌려준다. 조용히 빈 결과가 되는 걸 막는다.
-        if str(j.get("rt_cd", "0")) != "0":
-            sig = (tr_id, str(j.get("msg_cd")))
-            if sig not in self._seen_err:
-                self._seen_err.add(sig)
-                self.log(f"KIS 오류 [{tr_id}] {j.get('msg_cd')}: {str(j.get('msg1'))[:120]}")
+        try:
+            r = requests.get(f"{self.base}{path}", headers=h, params=params, timeout=timeout)
+        except Exception as e:
+            self._log_once((tr_id, "net"), f"KIS 통신 실패 [{tr_id}]: {type(e).__name__} {str(e)[:120]}")
+            return {}
+        try:
+            j = r.json()
+        except ValueError:
+            self._log_once((tr_id, r.status_code, "notjson"),
+                           f"KIS 응답이 JSON 이 아님 [{tr_id}] HTTP {r.status_code}: {r.text[:160]}")
+            return {}
+        # KIS 는 오류를 HTTP 200 + rt_cd 로도, HTTP 4xx/5xx 로도 돌려준다. 둘 다 잡는다.
+        if r.status_code != 200 or str(j.get("rt_cd", "0")) != "0":
+            self._log_once(
+                (tr_id, r.status_code, str(j.get("msg_cd"))),
+                f"KIS 오류 [{tr_id}] HTTP {r.status_code} {j.get('msg_cd') or ''}: "
+                f"{str(j.get('msg1') or r.text)[:160]}")
         return j
+
+    def _log_once(self, sig, msg: str):
+        if sig not in self._seen_err:
+            self._seen_err.add(sig)
+            self.log(msg)
 
     # ── 국내 ────────────────────────────────────────────────────────────
     def price(self, code: str) -> dict | None:
@@ -250,15 +266,18 @@ class KIS:
 
         proc_date/proc_time(최종처리일시)을 그대로 실어 보낸다. 호출 시각과 견주면
         이 시세가 실시간인지 몇 분 지연인지 바로 알 수 있다."""
-        try:
-            j = self._get("/uapi/overseas-futureoption/v1/quotations/inquire-price",
-                          "HHDFC55010000", {"SRS_CD": srs_cd})
-        except Exception:
-            return None
+        j = self._get("/uapi/overseas-futureoption/v1/quotations/inquire-price",
+                      "HHDFC55010000", {"SRS_CD": srs_cd})
         o = j.get("output1") or j.get("output") or {}
         if isinstance(o, list):
             o = o[0] if o else {}
         if not o or _f(o, "last_price") <= 0:
+            # 응답은 왔는데 시세가 없는 경우. 권한 문제인지, 종목코드가 없는 건지,
+            # 응답 구조가 내 가정과 다른 건지 구분되도록 실제 모양을 한 번 남긴다.
+            if j:
+                self._log_once(("futshape",),
+                               f"해외선물 시세 없음 (예: {srs_cd}) — 응답 키 {list(j)[:6]}, "
+                               f"rt_cd={j.get('rt_cd')}, output1={str(o)[:120]}")
             return None
         return {"code": srs_cd, "market": "fut", "name": srs_cd,
                 "last": _f(o, "last_price"), "chg_pct": _f(o, "prev_diff_rate"),
@@ -284,6 +303,34 @@ class KIS:
         return [{"date": r.get("data_date"), "close": _f(r, "last_price"),
                  "volume": _f(r, "vol")}
                 for r in (j.get("output2") or []) if _f(r, "last_price") > 0]
+
+    def fut_probe(self, symbols: list[str]) -> None:
+        """진단 전용. 해외선물 상품기본정보로 종목코드 여러 개를 한 번에 물어보고
+        응답을 그대로 로그에 남긴다. 근월물을 하나도 못 찾았을 때 그 이유가
+        (1) 시세 권한 없음 (2) 종목코드 형식이 다름 (3) 응답 구조가 다름
+        중 무엇인지 가르는 데 쓴다. 호출 1회면 끝나므로 비용이 없다."""
+        syms = [s for s in symbols if s][:32]
+        if not syms:
+            return
+        params = {"QRY_CNT": str(len(syms))}
+        for i, s in enumerate(syms, 1):
+            params[f"SRS_CD_{i:02d}"] = s
+        j = self._get("/uapi/overseas-futureoption/v1/quotations/search-contract-detail",
+                      "HHDFC55200000", params)
+        if not j:
+            self.log("진단: 상품기본정보도 응답이 없습니다 → 해외선물 시세 권한 문제로 보입니다")
+            return
+        rows = j.get("output") or j.get("output1") or j.get("output2") or []
+        if isinstance(rows, dict):
+            rows = [rows]
+        self.log(f"진단: 상품기본정보 rt_cd={j.get('rt_cd')} msg={str(j.get('msg1'))[:80]} "
+                 f"응답키={list(j)[:6]} 행수={len(rows) if isinstance(rows, list) else '?'}")
+        for r in (rows if isinstance(rows, list) else [])[:3]:
+            if isinstance(r, dict):
+                keep = {k: r.get(k) for k in
+                        ("srs_cd", "exch_cd", "clas_cd", "expr_date", "remn_cnt", "stat_tp")
+                        if k in r}
+                self.log(f"진단: 샘플 {keep or list(r)[:8]}")
 
     # 해외는 종목코드만으로는 거래소를 모른다. 한 번 찾으면 state/ 에 적어 두고 재사용한다.
     def resolve_excd(self, symb: str, cache: dict) -> str | None:
