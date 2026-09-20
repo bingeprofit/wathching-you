@@ -1,0 +1,78 @@
+name: 신호 성과 집계
+
+# 장중에는 '앞으로 어떻게 될지' 를 알 수 없다. 하루가 지나야 T+1 이 생긴다.
+# 그래서 장이 다 끝난 뒤 하루 한 번 돌면서 signals.jsonl 의 빈 칸을 채우고,
+# 신호에 엣지가 있는지 집계해 텔레그램으로 보낸다.
+#
+# 07:00 UTC = 16:00 KST — 한국장(~15:35 KST)이 끝난 뒤이고,
+# 미국장 루프(13:30~21:00 UTC)와도 겹치지 않는 유일한 구간이다.
+# 겹치면 두 잡이 같은 캐시를 서로 덮어써서 기록이 유실된다.
+#
+# 한국과 미국은 캐시가 따로라 signals.jsonl 도 둘이다. 각각 복원해 따로 돌린다.
+
+on:
+  schedule:
+    - cron: "0 7 * * 1-5"
+  workflow_dispatch:
+    inputs:
+      attach:
+        description: "원본 jsonl 도 텔레그램에 첨부 (분석용)"
+        type: boolean
+        default: false
+
+concurrency:
+  group: signal-review
+  cancel-in-progress: false
+
+jobs:
+  review:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+      - run: pip install -r requirements.txt
+
+      # 한국 캐시 — 알림 기록 + 모의투자 장부가 여기 있다.
+      - name: 한국 상태 복원
+        uses: actions/cache@v4
+        with:
+          path: state
+          key: intraday-kr-${{ github.run_id }}
+          restore-keys: intraday-kr-
+
+      # 미국 캐시 — 알림 기록만. 디렉터리를 나눠야 서로 덮어쓰지 않는다.
+      - name: 미국 상태 복원
+        uses: actions/cache@v4
+        with:
+          path: state_us
+          key: intraday-us-${{ github.run_id }}
+          restore-keys: intraday-us-
+
+      - name: 한국 — 수익률 채우고 집계
+        env:
+          TELEGRAM_TOKEN:   ${{ secrets.TELEGRAM_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          KIS_APP_KEY:      ${{ secrets.KIS_APP_KEY }}
+          KIS_APP_SECRET:   ${{ secrets.KIS_APP_SECRET }}
+          ROUND_TRIP_PCT:   "0.55"
+          STATE_DIR:        "state"
+        run: |
+          python backfill.py --send \
+            ${{ github.event.inputs.attach == 'true' && '--attach' || '' }}
+
+      - name: 미국 — 수익률 채우고 집계
+        env:
+          TELEGRAM_TOKEN:   ${{ secrets.TELEGRAM_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          KIS_APP_KEY:      ${{ secrets.KIS_APP_KEY }}
+          KIS_APP_SECRET:   ${{ secrets.KIS_APP_SECRET }}
+          # 미국은 왕복 비용이 낮다 (증권거래세 없음, 수수료 + 슬리피지만).
+          ROUND_TRIP_PCT:   "0.25"
+          STATE_DIR:        "state_us"
+        run: |
+          python backfill.py --send \
+            ${{ github.event.inputs.attach == 'true' && '--attach' || '' }}
