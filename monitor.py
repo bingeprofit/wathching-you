@@ -377,8 +377,13 @@ def fut_symbols(api) -> dict[str, dict]:
     except Exception:
         c = {}
     prev = dict(c.get("map") or {})
-    if c.get("date") == today and prev:
-        return prev
+    if c.get("date") == today:
+        if prev:
+            return prev
+        if c.get("failed"):
+            # 오늘 이미 권한/코드 문제로 실패한 것이 확인됐다. 60초 루프에서 매 분
+            # 다시 두드리면 하루 수천 번을 헛돌고 KIS 유량만 잡아먹는다.
+            return {}
     out, roll = {}, []
     roots = watchlist("fut")
     for n, root in enumerate(roots):
@@ -396,6 +401,11 @@ def fut_symbols(api) -> dict[str, dict]:
             log(f"'{root}' 근월물을 하나도 못 찾았습니다 — 나머지 품목 조회를 건너뛰고 원인을 확인합니다")
             probe = cands[:4] + (fut_candidates(roots[1])[:4] if len(roots) > 1 else [])
             api.fut_probe(probe)
+            os.makedirs(STATE_DIR, exist_ok=True)
+            try:                      # 오늘은 더 시도하지 않는다고 기록
+                json.dump({"date": today, "map": {}, "failed": True}, open(p, "w"))
+            except Exception:
+                pass
             return {}
     for root in roll:                  # 롤오버된 품목은 이력·참조데이터를 초기화
         _HIST.pop(f"fut:{root}", None)
@@ -412,6 +422,7 @@ def fut_symbols(api) -> dict[str, dict]:
 
 
 _DELAY_PROBED = [False]
+_FUT_WARNED = [False]       # 권한 경고는 실행당 한 번만
 
 
 def probe_delay(q: dict):
@@ -438,7 +449,11 @@ def scan_fut(universe: str = "focus") -> list[dict]:
         log("KIS_APP_KEY/SECRET 미설정 → 선물 스캔 생략"); return []
     syms = fut_symbols(api)
     if not syms:
-        log("선물 근월물을 찾지 못했습니다 — 해외선물 시세 이용 권한을 확인하세요")
+        if not _FUT_WARNED[0]:        # 루프에서 매 분 같은 줄을 찍지 않는다
+            _FUT_WARNED[0] = True
+            log("선물 근월물을 찾지 못했습니다 — 해외선물 시세 이용 권한을 확인하세요. "
+                "위 'KIS 오류' 줄의 msg_cd 가 원인입니다 "
+                "(EGW00550 = CME 거래소 시세 신청이 안 된 계좌)")
         return []
 
     def one(item):
