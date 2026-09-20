@@ -46,12 +46,14 @@ def _f(o: dict, k: str, d: float = 0.0) -> float:
 
 class KIS:
     def __init__(self, app_key: str, app_secret: str, paper: bool = False,
-                 state_dir: str = "state", min_gap: float = 0.06, log=print):
+                 state_dir: str = "state", min_gap: float = 0.12, log=print):
         self.key, self.sec = app_key, app_secret
         self.base = PAPER if paper else PROD
         self.state_dir = state_dir
         self.log = log
-        self.min_gap = min_gap           # 실전 유량제한 초당 20건 → 여유를 두고 ~16건/초
+        # 실전 한도는 문서상 초당 20건이지만 실제로는 더 빡빡하다 (EGW00201).
+        # 초당 ~8건에서 시작해, 걸릴 때마다 _get 이 스스로 간격을 늘린다.
+        self.min_gap = min_gap
         self._tok, self._exp = None, 0.0
         self._last_call, self._lock = 0.0, threading.Lock()
         self._seen_err: set = set()      # 같은 오류를 매 분 찍지 않기 위해
@@ -105,7 +107,8 @@ class KIS:
                 time.sleep(self.min_gap - gap)
             self._last_call = time.time()
 
-    def _get(self, path: str, tr_id: str, params: dict, timeout: int = 15) -> dict:
+    def _get(self, path: str, tr_id: str, params: dict, timeout: int = 15,
+             _retry: int = 0) -> dict:
         """실패해도 예외를 던지지 않고 빈 dict 를 돌려준다. 대신 **무슨 일이 있었는지
         반드시 한 번은 로그로 남긴다.** 예외로 던지면 호출부의 try/except 가 삼켜서
         '아무것도 못 찾음'만 남고 원인을 알 수 없게 된다."""
@@ -126,9 +129,21 @@ class KIS:
             return {}
         # KIS 는 오류를 HTTP 200 + rt_cd 로도, HTTP 4xx/5xx 로도 돌려준다. 둘 다 잡는다.
         if r.status_code != 200 or str(j.get("rt_cd", "0")) != "0":
+            code = str(j.get("msg_cd") or "")
+            # EGW00201 = 초당 거래건수 초과. 실패로 끝내면 그 종목이 통째로 빠져
+            # 스캔에 구멍이 생긴다. 호출 간격을 스스로 늘리고 다시 시도한다.
+            # 문서상 실전 한도는 초당 20건이지만 실제로는 더 빡빡해서, 고정값을
+            # 정해 두기보다 맞을 때마다 조여 가는 편이 안전하다.
+            if code == "EGW00201" and _retry < 3:
+                with self._lock:
+                    self.min_gap = min(round(self.min_gap * 1.6, 3), 0.4)
+                self._log_once(("rate", self.min_gap),
+                               f"KIS 유량 초과 → 호출 간격 {self.min_gap:.2f}초로 늘리고 재시도")
+                time.sleep(0.3 * (_retry + 1))
+                return self._get(path, tr_id, params, timeout, _retry + 1)
             self._log_once(
-                (tr_id, r.status_code, str(j.get("msg_cd"))),
-                f"KIS 오류 [{tr_id}] HTTP {r.status_code} {j.get('msg_cd') or ''}: "
+                (tr_id, r.status_code, code),
+                f"KIS 오류 [{tr_id}] HTTP {r.status_code} {code}: "
                 f"{str(j.get('msg1') or r.text)[:160]}")
         return j
 
