@@ -207,7 +207,8 @@ class PaperKIS:
                 "FNCG_AMT_AUTO_RDPT_YN": "N", "PRCS_DVSN": "00",
                 "CTX_AREA_FK100": "", "CTX_AREA_NK100": ""}
 
-    def _bal_raw(self, ofl: str, prod: str | None = None, quiet: bool = False):
+    def _bal_raw(self, ofl: str, prod: str | None = None, quiet: bool = False,
+                 _retry: int = 0):
         """(응답 dict 또는 None, 오류코드). 진단용으로 오류코드를 함께 돌려준다."""
         try:
             r = requests.get(f"{PAPER_BASE}/uapi/domestic-stock/v1/trading/inquire-balance",
@@ -218,12 +219,37 @@ class PaperKIS:
             self.log(f"모의 잔고조회 통신 실패: {type(e).__name__} {str(e)[:120]}")
             return None, "NET"
         if r.status_code != 200 or str(j.get("rt_cd", "1")) != "0":
+            code = str(j.get("msg_cd") or f"HTTP{r.status_code}")
+            # 유량 초과는 '거부' 가 아니라 '답을 못 받음' 이다. 이걸 실패로 세면
+            # 멀쩡한 조합을 틀렸다고 판단해 버린다.
+            if code == "EGW00201" and _retry < 2:
+                time.sleep(1.0 * (_retry + 1))
+                return self._bal_raw(ofl, prod, quiet, _retry + 1)
             if not quiet:
                 self._fail("잔고조회", r, j)
-            code = str(j.get("msg_cd") or f"HTTP{r.status_code}")
             msg = str(j.get("msg1") or "").strip()[:60]
             return None, (f"{code} {msg}" if msg else code)
         return j, ""
+
+    def can_buy(self, prod: str | None = None) -> tuple[bool, str]:
+        """매수가능조회 — 잔고조회와 **다른 엔드포인트**로 같은 계좌를 물어본다.
+
+        둘 다 계좌번호를 받는데, 한쪽만 되면 파라미터 문제이고 둘 다 막히면
+        계좌가 이 앱키에 안 붙어 있다는 뜻이다. 그 둘을 가르려는 것이다.
+        읽기 전용이라 주문은 나가지 않는다."""
+        p = {"CANO": self.cano, "ACNT_PRDT_CD": prod or self.prod,
+             "PDNO": "005930", "ORD_UNPR": "0", "ORD_DVSN": "01",
+             "CMA_EVLU_AMT_ICLD_YN": "N", "OVRS_ICLD_YN": "N"}
+        try:
+            r = requests.get(f"{PAPER_BASE}/uapi/domestic-stock/v1/trading/inquire-psbl-order",
+                             timeout=20, params=p, headers=self._headers("VTTC8908R"))
+            j = r.json()
+        except Exception as e:
+            return False, f"통신 실패 {type(e).__name__}"
+        if r.status_code != 200 or str(j.get("rt_cd", "1")) != "0":
+            return False, (f"{j.get('msg_cd') or r.status_code} "
+                           f"{str(j.get('msg1') or '')[:60]}").strip()
+        return True, str((j.get("output") or {}).get("ord_psbl_cash") or "")
 
     def balance(self) -> dict[str, dict] | None:
         """보유종목 {종목코드: {qty, avg, last, pnl_pct}}. 실패하면 None.
@@ -268,12 +294,14 @@ class PaperKIS:
         # 잔고조회는 읽기 전용이라 몇 개 훑어봐도 위험이 없고, 한 번에 훑는 편이
         # '바꿔서 다시 돌려보세요' 를 반복하는 것보다 빠르다.
         lines, combos, seen = [], [], set()
-        for prod in (self.prod, "01", "02", "03", "22"):
+        for prod in (self.prod, "01", "02", "03"):
             for ofl in self.BAL_OFL:
                 if (prod, ofl) not in seen:
                     seen.add((prod, ofl))
                     combos.append((prod, ofl))
-        for prod, ofl in combos:
+        for n, (prod, ofl) in enumerate(combos):
+            if n:
+                time.sleep(0.4)          # 모의 서버는 유량 한도가 낮다
             j, code = self._bal_raw(ofl, prod, quiet=True)
             tag = f"상품코드 {prod} / OFL_YN {ofl or '공란'}"
             if j is not None:

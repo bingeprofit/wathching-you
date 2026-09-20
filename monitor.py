@@ -1088,6 +1088,9 @@ def paper_probe() -> None:
     # 틀려도 정상처럼 보여서, 정작 원인인 오타를 못 찾는다.
     log(f"모의계좌 {pk.cano[:4]}{'*' * max(0, pk.acc_len - 4)} "
         f"({pk.acc_len}자리) / 상품코드 {pk.prod}")
+    if getattr(pk, "padded", False):
+        log(f"  {pk.acc_len}자리로 들어와 앞에 0 을 채워 {pk.cano} 로 시도합니다 "
+            "(화면에서 선행 0 이 빠졌을 수 있습니다)")
     bad = pk.acct_problem()
     if bad:
         log(f"계좌번호 형식 오류 — {bad}")
@@ -1100,6 +1103,14 @@ def paper_probe() -> None:
     for l in lines:
         log(l)
     if not okb:
+        # 다른 엔드포인트로 같은 계좌를 물어본다. 둘 다 막히면 계좌가 이 앱키에
+        # 안 붙어 있다는 뜻이고, 한쪽만 되면 잔고조회 파라미터 문제다.
+        okc, info = pk.can_buy()
+        log(f"교차확인 — 매수가능조회: {'성공' if okc else '실패'} {info}")
+        if okc:
+            log("  계좌는 살아 있습니다. 잔고조회 파라미터만 문제이니 알려 주세요.")
+            return
+        log("  매수가능조회도 같은 이유로 막힙니다 → 계좌가 이 앱키에 연결돼 있지 않습니다.")
         log("잔고조회가 어느 조합으로도 안 됩니다. 가능성이 높은 순서로:")
         log("  1) 앱키와 계좌가 다른 세트 — 국내 앱키에 해외 모의계좌를 넣으면")
         log("     토큰은 발급되는데 잔고조회만 거부됩니다 (OPSQ2000 이 그 신호입니다).")
