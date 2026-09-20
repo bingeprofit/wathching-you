@@ -34,6 +34,8 @@ PROD = "https://openapi.koreainvestment.com:9443"
 PAPER = "https://openapivts.koreainvestment.com:29443"
 
 US_EXCHANGES = ["NAS", "NYS", "AMS"]     # 나스닥 / 뉴욕 / 아멕스
+# 잠깐 실패했다가 다시 물으면 되는 오류들 (KIS 안내 문구가 "재조회"인 것)
+TRANSIENT = {"EGW00316"}
 
 
 def _f(o: dict, k: str, d: float = 0.0) -> float:
@@ -142,6 +144,14 @@ class KIS:
                 self._log_once(("rate", self.min_gap),
                                f"KIS 유량 초과 → 호출 간격 {self.min_gap:.2f}초로 늘리고 재시도")
                 time.sleep(0.3 * (_retry + 1))
+                return self._get(path, tr_id, params, timeout, _retry + 1)
+            # EGW00316 = "조회 처리 중 오류. 재 조회 수행 부탁드립니다" — KIS 서버의
+            # 일시적 오류라 그냥 다시 물으면 대개 된다. 포기하면 그 종목의 일간
+            # 변동성을 못 구해 z 가 0 이 되고, 아무리 급등해도 영영 안 걸린다.
+            if code in TRANSIENT and _retry < 2:
+                self._log_once(("transient", tr_id, code),
+                               f"KIS 일시 오류 [{tr_id}] {code} → 재조회")
+                time.sleep(0.5 * (_retry + 1))
                 return self._get(path, tr_id, params, timeout, _retry + 1)
             self._log_once(
                 (tr_id, r.status_code, code),

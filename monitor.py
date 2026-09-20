@@ -148,15 +148,20 @@ def on_cooldown(st: dict, key: str) -> bool:
     return bool(t) and (time.time() - t) < CFG["COOLDOWN_MIN"] * 60
 
 
-def budget_left(st: dict) -> int:
+def budget_left(st: dict, ignore_hourly: bool = False) -> int:
     """이번 스캔에서 보낼 수 있는 알림 수. 시간당·일일 상한을 함께 적용한다.
-    1분 폴링에서는 상한이 없으면 변동성 큰 날 API 비용이 그대로 늘어난다."""
+    1분 폴링에서는 상한이 없으면 변동성 큰 날 API 비용이 그대로 늘어난다.
+
+    ignore_hourly 는 수동 테스트용이다. 설정 중에 몇 번 돌려보면 시간당 상한에
+    걸려 '알림 0건'만 나오는데, 그러면 정작 확인하려던 것을 확인할 수 없다.
+    일일 상한은 그대로 지키므로 비용은 여전히 묶여 있다."""
     now = time.time()
     st["log"] = [t for t in st.get("log", []) if now - t < 86400]
     hour = sum(1 for t in st["log"] if now - t < 3600)
-    return max(0, min(CFG["MAX_ALERTS"],
-                      CFG["MAX_PER_HOUR"] - hour,
-                      CFG["MAX_PER_DAY"] - len(st["log"])))
+    caps = [CFG["MAX_ALERTS"], CFG["MAX_PER_DAY"] - len(st["log"])]
+    if not ignore_hourly:
+        caps.append(CFG["MAX_PER_HOUR"] - hour)
+    return max(0, min(caps))
 
 
 # ── 장 시간 ──────────────────────────────────────────────────────────────
@@ -787,15 +792,18 @@ def render(picks: list[dict], attrib: dict, market: str) -> str:
 
 
 # ── 실행 ─────────────────────────────────────────────────────────────────
-def scan_once(market: str, st: dict, universe: str) -> tuple[int, int]:
+def scan_once(market: str, st: dict, universe: str,
+              ignore_hourly: bool = False) -> tuple[int, int]:
     """한 번 스캔하고 알릴 것이 있으면 보낸다. (보낸 건수, 스캔한 종목수)."""
     rows = {"us": scan_us, "kr": scan_kr, "fut": scan_fut}[market](universe)
     save_hist(market)
     if not rows:
         return 0, 0
-    lim = budget_left(st)
+    lim = budget_left(st, ignore_hourly)
     if lim <= 0:
-        log(f"알림 예산 소진 (시간당 {CFG['MAX_PER_HOUR']} / 일 {CFG['MAX_PER_DAY']}) → 대기")
+        used = len(st.get("log", []))
+        log(f"알림 예산 소진 (시간당 {CFG['MAX_PER_HOUR']} / 일 {CFG['MAX_PER_DAY']}, "
+            f"오늘 {used}건 사용) → 대기. 수동 테스트는 --force 로 시간당 상한을 건너뜁니다")
         return 0, len(rows)
     picks = pick(rows, st, lim)
     if not picks:
@@ -860,7 +868,7 @@ def main():
     st = load_state(a.market)
     load_hist(a.market)
     if not a.loop_until:
-        sent, nrows = scan_once(a.market, st, a.universe)
+        sent, nrows = scan_once(a.market, st, a.universe, ignore_hourly=a.force)
         save_state(a.market, st)
         log(f"완료 — {nrows}종목 스캔, 알림 {sent}건"); return
 
@@ -873,7 +881,7 @@ def main():
         t0 = time.time()
         n += 1
         try:
-            s1, nrows = scan_once(a.market, st, a.universe)
+            s1, nrows = scan_once(a.market, st, a.universe, ignore_hourly=a.force)
             sent += s1
             fail = 0
         except KeyboardInterrupt:
