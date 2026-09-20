@@ -17,7 +17,7 @@
 명시돼 있어, 구 TR(VTTC0802U/0801U) 로 짜 두면 어느 날 조용히 주문이 안 나간다.
 """
 from __future__ import annotations
-import json, os, time, datetime as dt
+import json, os, re, time, datetime as dt
 from zoneinfo import ZoneInfo
 import requests
 
@@ -60,8 +60,11 @@ class PaperKIS:
                  state_dir: str = "state", log=print, prod_cd: str = "01"):
         self.key, self.sec = app_key, app_secret
         # 계좌번호는 앞 8자리(CANO) + 상품코드 2자리(ACNT_PRDT_CD)로 나뉜다.
-        acc = (account or "").replace("-", "").strip()
-        self.cano, self.prod = acc[:8], (acc[8:10] or prod_cd)
+        # 하이픈·공백·괄호 등 숫자가 아닌 것은 전부 털어낸다. 시크릿에 붙여넣을 때
+        # 눈에 안 보이는 문자가 섞여 들어오는 일이 잦다.
+        digits = re.sub(r"\D", "", account or "")
+        self.acc_len = len(digits)
+        self.cano, self.prod = digits[:8], (digits[8:10] or prod_cd)
         self.state_dir, self.log = state_dir, log
         self._tok, self._exp = "", 0.0
         self._seen: set = set()
@@ -110,6 +113,18 @@ class PaperKIS:
             pass
         self.log("모의투자 토큰 신규 발급")
         return self._tok
+
+    def acct_problem(self) -> str:
+        """계좌번호 자릿수가 이상하면 그 이유를 돌려준다. 정상이면 빈 문자열.
+
+        7자리나 9자리가 들어와도 KIS 는 '계좌번호가 틀렸다' 고만 답하지, 몇 자리가
+        들어왔는지는 말해 주지 않는다. 그래서 보내기 전에 여기서 먼저 잡는다."""
+        if self.acc_len == 0:
+            return "계좌번호가 비어 있습니다"
+        if self.acc_len not in (8, 10):
+            return (f"계좌번호 숫자가 {self.acc_len}자리입니다 — "
+                    "8자리(계좌) 또는 10자리(계좌8+상품코드2)여야 합니다")
+        return ""
 
     def ready(self) -> bool:
         return bool(self.key and self.sec and self.cano and self.token())

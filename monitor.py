@@ -1084,7 +1084,15 @@ def paper_probe() -> None:
                                ("KIS_PAPER_ACCOUNT", acct)) if not v]
         log(f"모의투자 설정 없음 — 비어 있는 시크릿: {', '.join(miss)}"); return
     pk = P.PaperKIS(key, sec, acct, state_dir=STATE_DIR, log=log)
-    log(f"모의계좌 {pk.cano[:4]}**** / 상품코드 {pk.prod}")
+    # 마스킹하되 자릿수는 그대로 보여 준다. 별표를 고정 개수로 찍으면 자릿수가
+    # 틀려도 정상처럼 보여서, 정작 원인인 오타를 못 찾는다.
+    log(f"모의계좌 {pk.cano[:4]}{'*' * max(0, pk.acc_len - 4)} "
+        f"({pk.acc_len}자리) / 상품코드 {pk.prod}")
+    bad = pk.acct_problem()
+    if bad:
+        log(f"계좌번호 형식 오류 — {bad}")
+        log("  KIS_PAPER_ACCOUNT 시크릿을 다시 확인하세요. 하이픈은 넣으셔도 됩니다.")
+        return
     if not pk.token():
         log("토큰 발급 실패 → 위 오류 메시지를 확인하세요"); return
     log("토큰 발급 성공")
