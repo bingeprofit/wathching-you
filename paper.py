@@ -65,6 +65,7 @@ class PaperKIS:
         self.state_dir, self.log = state_dir, log
         self._tok, self._exp = "", 0.0
         self._seen: set = set()
+        self._bal_ofl: str | None = None      # 통하는 OFL_YN 값 (첫 조회에서 확정)
 
     # ── 토큰 ────────────────────────────────────────────────────────────
     def _token_path(self) -> str:
@@ -171,25 +172,49 @@ class PaperKIS:
         return {"ord_no": o.get("ODNO") or "", "org": o.get("KRX_FWDG_ORD_ORGNO") or "",
                 "tmd": o.get("ORD_TMD") or "", "msg": str(j.get("msg1") or "")[:60]}
 
+    # OFL_YN 은 문서상 공란인데, 모의 서버가 공란을 거부하고 "N" 을 요구하는
+    # 사례가 보고돼 있다. 어느 쪽이 맞는지 실호출 전에는 알 수 없어, 처음 한 번은
+    # 양쪽을 시도해 보고 통한 조합을 기억한다.
+    BAL_OFL = ("", "N")
+
+    def _bal_params(self, ofl: str, prod: str | None = None) -> dict:
+        return {"CANO": self.cano, "ACNT_PRDT_CD": prod or self.prod,
+                "AFHR_FLPR_YN": "N", "OFL_YN": ofl, "INQR_DVSN": "02",
+                "UNPR_DVSN": "01", "FUND_STTL_ICLD_YN": "N",
+                "FNCG_AMT_AUTO_RDPT_YN": "N", "PRCS_DVSN": "00",
+                "CTX_AREA_FK100": "", "CTX_AREA_NK100": ""}
+
+    def _bal_raw(self, ofl: str, prod: str | None = None, quiet: bool = False):
+        """(응답 dict 또는 None, 오류코드). 진단용으로 오류코드를 함께 돌려준다."""
+        try:
+            r = requests.get(f"{PAPER_BASE}/uapi/domestic-stock/v1/trading/inquire-balance",
+                             timeout=20, params=self._bal_params(ofl, prod),
+                             headers=self._headers(TR_BAL))
+            j = r.json()
+        except Exception as e:
+            self.log(f"모의 잔고조회 통신 실패: {type(e).__name__} {str(e)[:120]}")
+            return None, "NET"
+        if r.status_code != 200 or str(j.get("rt_cd", "1")) != "0":
+            if not quiet:
+                self._fail("잔고조회", r, j)
+            return None, str(j.get("msg_cd") or f"HTTP{r.status_code}")
+        return j, ""
+
     def balance(self) -> dict[str, dict] | None:
         """보유종목 {종목코드: {qty, avg, last, pnl_pct}}. 실패하면 None.
 
         None 과 {} 를 구분하는 것이 중요하다. {} 는 '정말 하나도 없다',
         None 은 '조회를 못 했다' — 후자를 빈 잔고로 읽으면 장부의 포지션을
         전부 지워 버린다."""
-        p = {"CANO": self.cano, "ACNT_PRDT_CD": self.prod, "AFHR_FLPR_YN": "N",
-             "OFL_YN": "", "INQR_DVSN": "02", "UNPR_DVSN": "01",
-             "FUND_STTL_ICLD_YN": "N", "FNCG_AMT_AUTO_RDPT_YN": "N",
-             "PRCS_DVSN": "00", "CTX_AREA_FK100": "", "CTX_AREA_NK100": ""}
-        try:
-            r = requests.get(f"{PAPER_BASE}/uapi/domestic-stock/v1/trading/inquire-balance",
-                             timeout=20, params=p, headers=self._headers(TR_BAL))
-            j = r.json()
-        except Exception as e:
-            self.log(f"모의 잔고조회 통신 실패: {type(e).__name__} {str(e)[:120]}")
-            return None
-        if r.status_code != 200 or str(j.get("rt_cd", "1")) != "0":
-            self._fail("잔고조회", r, j)
+        tries = (self._bal_ofl,) if self._bal_ofl is not None else self.BAL_OFL
+        j = None
+        for k, ofl in enumerate(tries):
+            j, code = self._bal_raw(ofl, quiet=(k < len(tries) - 1))
+            if j is not None:
+                if self._bal_ofl is None:
+                    self._bal_ofl = ofl
+                break
+        if j is None:
             return None
         out = {}
         for x in (j.get("output1") or []):
@@ -202,18 +227,33 @@ class PaperKIS:
 
     def cash(self) -> float | None:
         """주문가능현금. 잔고조회 output2 에서 꺼낸다."""
-        p = {"CANO": self.cano, "ACNT_PRDT_CD": self.prod, "AFHR_FLPR_YN": "N",
-             "OFL_YN": "", "INQR_DVSN": "02", "UNPR_DVSN": "01",
-             "FUND_STTL_ICLD_YN": "N", "FNCG_AMT_AUTO_RDPT_YN": "N",
-             "PRCS_DVSN": "00", "CTX_AREA_FK100": "", "CTX_AREA_NK100": ""}
-        try:
-            r = requests.get(f"{PAPER_BASE}/uapi/domestic-stock/v1/trading/inquire-balance",
-                             timeout=20, params=p, headers=self._headers(TR_BAL))
-            j = r.json()
-            rows = j.get("output2") or []
-            return _f(rows[0], "dnca_tot_amt") if rows else None
-        except Exception:
+        j, _ = self._bal_raw(self._bal_ofl if self._bal_ofl is not None else "", quiet=True)
+        if not j:
             return None
+        rows = j.get("output2") or []
+        return _f(rows[0], "dnca_tot_amt") if rows else None
+
+    def diagnose(self) -> tuple[bool, list[str]]:
+        """계좌 조합을 바꿔 가며 잔고조회를 시도하고 무엇이 통했는지 알려준다.
+
+        모의투자 첫 설정에서 막히는 지점이 거의 여기다. 오류코드 하나만 보고는
+        '파라미터가 틀렸나, 계좌가 틀렸나' 를 가릴 수 없어서, 조합을 직접
+        돌려 보고 결과를 나란히 보여 준다."""
+        lines, combos, seen = [], [], set()
+        for prod in (self.prod, "01"):
+            for ofl in self.BAL_OFL:
+                if (prod, ofl) not in seen:
+                    seen.add((prod, ofl))
+                    combos.append((prod, ofl))
+        for prod, ofl in combos:
+            j, code = self._bal_raw(ofl, prod, quiet=True)
+            tag = f"상품코드 {prod} / OFL_YN {ofl or '공란'}"
+            if j is not None:
+                lines.append(f"  {tag} → 성공")
+                self._bal_ofl, self.prod = ofl, prod
+                return True, lines
+            lines.append(f"  {tag} → 실패 {code}")
+        return False, lines
 
 
 # ── 텔레그램 승인 ─────────────────────────────────────────────────────────

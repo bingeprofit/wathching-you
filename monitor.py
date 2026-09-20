@@ -1088,6 +1088,18 @@ def paper_probe() -> None:
     if not pk.token():
         log("토큰 발급 실패 → 위 오류 메시지를 확인하세요"); return
     log("토큰 발급 성공")
+    okb, lines = pk.diagnose()
+    for l in lines:
+        log(l)
+    if not okb:
+        log("잔고조회가 어느 조합으로도 안 됩니다. 가능성이 높은 순서로:")
+        log("  1) 앱키와 계좌가 다른 세트 — 국내 앱키에 해외 모의계좌를 넣으면")
+        log("     토큰은 발급되는데 잔고조회만 거부됩니다 (OPSQ2000 이 그 신호입니다).")
+        log("     KIS Developers 에서 이 앱키에 연결된 계좌번호를 확인하세요.")
+        log("  2) 계좌번호 오타 — 앞뒤 공백, 자릿수, 상품코드를 다시 보세요.")
+        log(f"     지금 입력값은 {len(pk.cano)}자리 + 상품코드 {pk.prod} 로 읽혔습니다.")
+        log("  3) 국내주식 모의투자 신청이 안 된 계좌 — 해외만 신청된 경우입니다.")
+        return
     bal = pk.balance()
     if bal is None:
         log("잔고조회 실패 → 계좌번호나 모의투자 신청 상태를 확인하세요"); return
