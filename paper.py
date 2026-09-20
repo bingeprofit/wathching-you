@@ -17,7 +17,7 @@
 명시돼 있어, 구 TR(VTTC0802U/0801U) 로 짜 두면 어느 날 조용히 주문이 안 나간다.
 """
 from __future__ import annotations
-import json, os, re, time, datetime as dt
+import hashlib, json, os, re, time, datetime as dt
 from zoneinfo import ZoneInfo
 import requests
 
@@ -26,6 +26,8 @@ PAPER_BASE = "https://openapivts.koreainvestment.com:29443"
 
 # 신 TR (모의투자는 앞에 V). 실전은 T 로 시작하지만 이 파일은 모의 전용이다.
 TR_BUY, TR_SELL, TR_BAL = "VTTC0012U", "VTTC0011U", "VTTC8434R"
+# 토큰이 죽었을 때 나오는 코드들. 캐시를 버리고 한 번 다시 받으면 된다.
+TOKEN_DEAD = {"EGW00123", "EGW00121", "EGW00105"}
 
 
 def _f(d: dict, k: str) -> float:
@@ -80,11 +82,27 @@ class PaperKIS:
     def _token_path(self) -> str:
         return os.path.join(self.state_dir, "kis_paper_token.json")
 
+    def _key_fp(self) -> str:
+        """앱키 지문. 토큰은 앱키에 묶여 있어서, 키가 바뀌면 캐시된 토큰은
+        무효가 된다. 그걸 모르고 계속 쓰면 EGW00123(만료된 token)이 나는데,
+        메시지가 '만료' 라 원인을 엉뚱한 데서 찾게 된다."""
+        return hashlib.sha256(self.key.encode()).hexdigest()[:16]
+
+    def _clear_token(self) -> None:
+        self._tok, self._exp = "", 0.0
+        try:
+            os.remove(self._token_path())
+        except OSError:
+            pass
+
     def token(self, _retry: int = 0) -> str:
         if self._tok and time.time() < self._exp - 600:
             return self._tok
         try:
             c = json.load(open(self._token_path()))
+            if c.get("fp") != self._key_fp():
+                self.log("앱키가 바뀌었습니다 — 캐시된 모의 토큰을 버리고 새로 받습니다")
+                raise ValueError("key changed")
             if time.time() < c.get("exp", 0) - 600:
                 self._tok, self._exp = c["tok"], c["exp"]
                 return self._tok
@@ -114,7 +132,8 @@ class PaperKIS:
         self._exp = time.time() + int(j.get("expires_in") or 86400)
         os.makedirs(self.state_dir, exist_ok=True)
         try:
-            json.dump({"tok": self._tok, "exp": self._exp}, open(self._token_path(), "w"))
+            json.dump({"tok": self._tok, "exp": self._exp, "fp": self._key_fp()},
+                      open(self._token_path(), "w"))
         except Exception:
             pass
         self.log("모의투자 토큰 신규 발급")
@@ -168,7 +187,8 @@ class PaperKIS:
 
     # ── 주문 ────────────────────────────────────────────────────────────
     def order(self, code: str, qty: int, side: str = "buy",
-              ord_dvsn: str = "01", price: int = 0) -> dict | None:
+              ord_dvsn: str = "01", price: int = 0,
+              _retry: bool = False) -> dict | None:
         """국내주식 주문. side 는 buy/sell, ord_dvsn 01=시장가 00=지정가.
         성공하면 {"ord_no", "krx_fwdg_ord_orgno", "ord_tmd"}, 실패하면 None."""
         if qty < 1:
@@ -189,6 +209,9 @@ class PaperKIS:
             self.log(f"모의 주문 통신 실패 [{code}]: {type(e).__name__} {str(e)[:120]}")
             return None
         if r.status_code != 200 or str(j.get("rt_cd", "1")) != "0":
+            if str(j.get("msg_cd") or "") in TOKEN_DEAD and not _retry:
+                self._clear_token()
+                return self.order(code, qty, side, ord_dvsn, price, _retry=True)
             self._fail(f"주문({side})", r, j)
             return None
         o = j.get("output") or {}
@@ -225,13 +248,18 @@ class PaperKIS:
             if code == "EGW00201" and _retry < 2:
                 time.sleep(1.0 * (_retry + 1))
                 return self._bal_raw(ofl, prod, quiet, _retry + 1)
+            # 토큰이 죽었으면 버리고 한 번 다시 받는다. 캐시가 남아 있는 한
+            # 몇 번을 돌려도 같은 오류만 반복된다.
+            if code in TOKEN_DEAD and _retry < 1:
+                self._clear_token()
+                return self._bal_raw(ofl, prod, quiet, _retry + 1)
             if not quiet:
                 self._fail("잔고조회", r, j)
             msg = str(j.get("msg1") or "").strip()[:60]
             return None, (f"{code} {msg}" if msg else code)
         return j, ""
 
-    def can_buy(self, prod: str | None = None) -> tuple[bool, str]:
+    def can_buy(self, prod: str | None = None, _retry: bool = False) -> tuple[bool, str]:
         """매수가능조회 — 잔고조회와 **다른 엔드포인트**로 같은 계좌를 물어본다.
 
         둘 다 계좌번호를 받는데, 한쪽만 되면 파라미터 문제이고 둘 다 막히면
@@ -247,6 +275,9 @@ class PaperKIS:
         except Exception as e:
             return False, f"통신 실패 {type(e).__name__}"
         if r.status_code != 200 or str(j.get("rt_cd", "1")) != "0":
+            if str(j.get("msg_cd") or "") in TOKEN_DEAD and not _retry:
+                self._clear_token()
+                return self.can_buy(prod, _retry=True)
             return False, (f"{j.get('msg_cd') or r.status_code} "
                            f"{str(j.get('msg1') or '')[:60]}").strip()
         return True, str((j.get("output") or {}).get("ord_psbl_cash") or "")
