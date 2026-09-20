@@ -60,7 +60,7 @@ class KIS:
     def _token_path(self) -> str:
         return os.path.join(self.state_dir, "kis_token.json")
 
-    def token(self) -> str:
+    def token(self, _retry: int = 0) -> str:
         if self._tok and time.time() < self._exp - 300:
             return self._tok
         p = self._token_path()
@@ -80,8 +80,16 @@ class KIS:
         except ValueError:
             raise RuntimeError(f"KIS 토큰 응답이 JSON 이 아님 (HTTP {r.status_code})")
         if "access_token" not in j:
+            # EGW00133 = 1분에 1회만 발급 가능. 워크플로(한국·미국·선물)는 캐시가
+            # 각각이라 같은 분에 뜨면 서로 부딪힌다. 이건 실패가 아니라 순서 문제이므로
+            # 기다렸다 다시 받는다. 키가 틀린 경우(EGW00201 등)는 바로 실패시킨다.
+            body = str(j)
+            if _retry < 2 and ("EGW00133" in body or "1분" in str(j.get("msg1", ""))):
+                self.log(f"토큰 발급 1분 제한에 걸림 — 70초 뒤 재시도 ({_retry + 1}/2)")
+                time.sleep(70)
+                return self.token(_retry + 1)
             # 자주 보는 것: EGW00133(1분 내 재발급), EGW00201(키 오류)
-            raise RuntimeError(f"KIS 토큰 발급 실패 (HTTP {r.status_code}): {str(j)[:300]}")
+            raise RuntimeError(f"KIS 토큰 발급 실패 (HTTP {r.status_code}): {body[:300]}")
         self._tok = j["access_token"]
         self._exp = time.time() + int(j.get("expires_in", 86400))
         os.makedirs(self.state_dir, exist_ok=True)
