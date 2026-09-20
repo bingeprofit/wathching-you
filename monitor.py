@@ -72,6 +72,20 @@ CFG = {
     "FUT_ROLL_DAYS": int(env("FUT_ROLL_DAYS", "4")),      # 잔존일수가 이보다 적으면 다음 월물로
     # 공개 저장소의 Actions 로그는 누구나 읽을 수 있다. 무엇을 보고 있는지 감추려면 1.
     "QUIET_LOG":     env("QUIET_LOG", "0") == "1",
+
+    # ── 모의투자 반자동 체결 ──────────────────────────────────────────
+    # 시세는 실전 키로 받고 주문만 모의 도메인으로 보낸다 (paper.py 참고).
+    # PAPER_TRADING=1 이고 --market kr 일 때만 버튼이 붙는다. 미국은 자는
+    # 시간이라 승인이 불가능하므로 전수 로깅만 한다.
+    "PAPER":            env("PAPER_TRADING", "0") == "1",
+    "PAPER_ORDER_KRW":  int(env("PAPER_ORDER_KRW", "10000000")),
+    "APPROVE_TTL_MIN":  int(env("APPROVE_TTL_MIN", "15")),
+    "HOLD_DAYS":        int(env("HOLD_DAYS", "5")),      # 시간청산: T+N 영업일
+    "STOP_SD":          float(env("STOP_SD", "1.5")),    # 손절: 진입가 -N×일간σ
+    "MAX_POSITIONS":    int(env("MAX_POSITIONS", "5")),
+    # 왕복 거래비용(%) — 증권거래세 0.15% + 수수료 + 급변 종목 슬리피지 가정.
+    # 모의투자는 슬리피지 없이 체결되므로 빼 줘야 실전에 가까운 수익률이 된다.
+    "ROUND_TRIP_PCT":   float(env("ROUND_TRIP_PCT", "0.55")),
 }
 
 # KIS 거래량급증 순위의 MINX 코드 (0:1분전 … 9:120분전)
@@ -742,21 +756,142 @@ def parse_items(text: str, stop=None) -> list[dict]:
     return salvaged
 
 
+# ── 전수 로깅 ────────────────────────────────────────────────────────────
+# 승인 여부와 무관하게 **모든 알림**을 남긴다. 반자동으로 체결된 것만 보면
+# 그것은 고른 표본이라, "이 신호에 엣지가 있나" 에는 답할 수 없다. 나중에
+# backfill.py 가 여기에 T+1·T+5 수익률을 채워 넣는다.
+def _num(x):
+    """NaN/inf 는 JSON 으로 못 쓴다 (json.dumps 가 표준 위반 문자열을 뱉는다)."""
+    try:
+        v = float(x)
+    except (TypeError, ValueError):
+        return None
+    return v if v == v and abs(v) != float("inf") else None
+
+
+def log_signals(picks: list[dict], attrib: dict, market: str) -> None:
+    now = dt.datetime.now(KST if market == "kr" else ET)
+    os.makedirs(STATE_DIR, exist_ok=True)
+    try:
+        with open(os.path.join(STATE_DIR, "signals.jsonl"), "a", encoding="utf-8") as f:
+            for r in picks:
+                a = attrib.get(r["ticker"], {})
+                f.write(json.dumps({
+                    "ts": int(time.time()), "date": now.strftime("%Y%m%d"),
+                    "hhmm": now.strftime("%H:%M"), "market": market,
+                    "ticker": r["ticker"], "name": r.get("name"), "excd": r.get("excd"),
+                    "px": _num(r.get("last")), "pct": _num(r.get("pct")),
+                    "z": _num(r.get("z")), "sd_daily": _num(r.get("sd_daily")),
+                    "burst": _num(r.get("burst")), "burst_min": _num(r.get("burst_min")),
+                    "vol_ratio": _num(r.get("vol_ratio")),
+                    "trigger": r.get("trigger"), "cause": a.get("cause"),
+                    "confidence": a.get("confidence"),
+                }, ensure_ascii=False) + "\n")
+    except Exception as e:
+        log(f"신호 로깅 실패: {str(e)[:80]}")
+
+
+# ── 모의투자 반자동 ──────────────────────────────────────────────────────
+_PAPER: dict = {}
+
+
+def paper_on(market: str) -> bool:
+    """한국장에서만 버튼을 단다. 미국 알림이 오는 시간엔 주무시므로 승인이
+    불가능하고, 만료만 쌓여 데이터가 지저분해진다."""
+    return bool(CFG["PAPER"]) and market == "kr"
+
+
+def _paper_mod():
+    """paper.py 를 불러온다. 없으면 None.
+
+    파일을 손으로 올리다 보면 monitor.py 만 갱신하고 paper.py 를 빠뜨리는 일이
+    생긴다. 그때 예외가 나면 send() 앞에서 터져서 **알림이 통째로 사라진다.**
+    반자동은 부가 기능이고 알림이 본체다. 없으면 없는 대로 돌아야 한다."""
+    if "mod" in _PAPER:
+        return _PAPER["mod"]
+    try:
+        import paper as P
+    except Exception as e:
+        log(f"paper.py 를 불러오지 못해 반자동 체결을 끕니다 ({type(e).__name__}) "
+            "— 알림과 로깅은 그대로 돕니다")
+        P = None
+    _PAPER["mod"] = P
+    return P
+
+
+def paper_ctx():
+    """(PaperKIS, 장부). 준비가 안 됐으면 (None, None)."""
+    if "pk" in _PAPER:
+        return _PAPER["pk"], _PAPER["bk"]
+    P = _paper_mod()
+    if P is None:
+        _PAPER["pk"] = _PAPER["bk"] = None
+        return None, None
+    key, sec = env("KIS_PAPER_APP_KEY"), env("KIS_PAPER_APP_SECRET")
+    acct = env("KIS_PAPER_ACCOUNT")
+    if not (key and sec and acct):
+        log("모의투자 키/계좌 미설정 → 반자동 체결 비활성 (알림·로깅은 그대로)")
+        _PAPER["pk"] = _PAPER["bk"] = None
+        return None, None
+    try:
+        pk = P.PaperKIS(key, sec, acct, state_dir=STATE_DIR, log=log)
+        _PAPER["pk"], _PAPER["bk"] = pk, P.load_book(STATE_DIR)
+    except Exception as e:
+        log(f"모의투자 초기화 실패 → 반자동 비활성: {type(e).__name__} {str(e)[:100]}")
+        _PAPER["pk"] = _PAPER["bk"] = None
+    return _PAPER["pk"], _PAPER["bk"]
+
+
+def paper_pump(market: str) -> None:
+    """승인 버튼 수거 + 자동 청산. 루프 매 회차에 부른다.
+
+    webhook 없이 getUpdates 로 돌기 때문에 서버를 따로 띄울 필요가 없다.
+    대신 승인이 한 박자 늦는다 — 알림, 버튼, 다음 스캔."""
+    if not paper_on(market):
+        return
+    try:
+        pk, bk = paper_ctx()
+    except Exception as e:
+        log(f"반자동 초기화 실패: {type(e).__name__} {str(e)[:100]}")
+        return
+    P = _paper_mod()
+    if not pk or P is None:
+        return
+    api = kis_api()
+    price_fn = (lambda c: api.price(c)) if api else (lambda c: None)
+    tok, cid = env("TELEGRAM_TOKEN"), env("TELEGRAM_CHAT_ID")
+    try:
+        P.collect(tok, bk, P.make_approver(pk, bk, price_fn, CFG, log), log)
+        for m in P.check_exits(pk, bk, price_fn, CFG, log):
+            log(m.replace("*", ""))
+            if tok and cid:
+                P.tg(tok, "sendMessage", chat_id=cid, text=m, parse_mode="Markdown")
+    except Exception as e:
+        log(f"반자동 처리 실패: {type(e).__name__} {str(e)[:150]}")
+    P.save_book(STATE_DIR, bk, log)
+
+
 # ── 알림 ─────────────────────────────────────────────────────────────────
-def send(picks: list[dict], attrib: dict, market: str):
+def send(picks: list[dict], attrib: dict, market: str, markup: str = ""):
     tok, cid = env("TELEGRAM_TOKEN"), env("TELEGRAM_CHAT_ID")
     txt = render(picks, attrib, market)
     if not (tok and cid):
         log("텔레그램 미설정 → 출력만"); print(txt); return
-    for i in range(0, len(txt), 3900):
-        c = txt[i:i + 3900]
+    chunks = [txt[i:i + 3900] for i in range(0, len(txt), 3900)] or [txt]
+    for n, c in enumerate(chunks):
+        # 키보드는 마지막 조각에만 붙인다. 조각마다 붙이면 같은 종목 버튼이
+        # 여러 벌 생겨서 어느 것을 눌렀는지가 흐려진다.
+        d = {"chat_id": cid, "text": c, "parse_mode": "Markdown",
+             "disable_web_page_preview": True}
+        if markup and n == len(chunks) - 1:
+            d["reply_markup"] = markup
         try:
-            r = requests.post(f"https://api.telegram.org/bot{tok}/sendMessage", timeout=30,
-                              data={"chat_id": cid, "text": c, "parse_mode": "Markdown",
-                                    "disable_web_page_preview": True})
+            r = requests.post(f"https://api.telegram.org/bot{tok}/sendMessage",
+                              timeout=30, data=d)
             if not r.ok:
-                requests.post(f"https://api.telegram.org/bot{tok}/sendMessage", timeout=30,
-                              data={"chat_id": cid, "text": c, "disable_web_page_preview": True})
+                d.pop("parse_mode", None)
+                requests.post(f"https://api.telegram.org/bot{tok}/sendMessage",
+                              timeout=30, data=d)
         except Exception as e:
             log(f"텔레그램 실패: {str(e)[:80]}")
 
@@ -812,7 +947,22 @@ def scan_once(market: str, st: dict, universe: str,
         f"{p['ticker']}({p['pct']:+.1f}%,{p.get('trigger','')})" for p in picks)
     log(f"스냅샷 {len(rows)}종목 → 알림 {len(picks)}{detail}")
     attrib = attribute(picks, market)
-    send(picks, attrib, market)
+    log_signals(picks, attrib, market)
+    # 버튼을 붙이다 실패하더라도 알림 자체는 반드시 나가야 한다.
+    # 반자동은 부가 기능이고, 급변을 알려 주는 것이 이 시스템의 본래 일이다.
+    markup = ""
+    if paper_on(market):
+        try:
+            pk, bk = paper_ctx()
+            P = _paper_mod()
+            if pk and P is not None:
+                markup = P.keyboard(picks, P.offer(bk, picks, market))
+                P.save_book(STATE_DIR, bk, log)
+        except Exception as e:
+            log(f"승인 버튼 생성 실패(알림은 그대로 발송): "
+                f"{type(e).__name__} {str(e)[:100]}")
+            markup = ""
+    send(picks, attrib, market, markup)
     now = time.time()
     for p in picks:
         st["sent"][p["ticker"]] = now
@@ -852,7 +1002,12 @@ def main():
                     help="시장 현지시각이 이 시각 전이면 즉시 종료 (앞 구간 잡과 겹치지 않게)")
     ap.add_argument("--max-minutes", type=int, default=340,
                     help="잡 최대 수명(분). GitHub Actions 6시간 한도 방어")
+    ap.add_argument("--paper-probe", action="store_true",
+                    help="모의투자 연결만 확인하고 종료 (주문 없음)")
     a = ap.parse_args()
+
+    if a.paper_probe:
+        paper_probe(); return
 
     tz = KST if a.market == "kr" else ET
     now = dt.datetime.now(tz)
@@ -869,6 +1024,7 @@ def main():
     load_hist(a.market)
     if not a.loop_until:
         sent, nrows = scan_once(a.market, st, a.universe, ignore_hourly=a.force)
+        paper_pump(a.market)
         save_state(a.market, st)
         log(f"완료 — {nrows}종목 스캔, 알림 {sent}건"); return
 
@@ -893,6 +1049,9 @@ def main():
                 log("연속 실패 5회 → 간격을 2배로 늘려 진정시킨다")
                 time.sleep(a.interval)
                 fail = 0
+        # 스캔이 실패해도 승인 수거와 청산은 돌아야 한다. 보유 중인 포지션이
+        # 스캔 오류 때문에 손절선을 넘겨 방치되는 것이 훨씬 나쁘다.
+        paper_pump(a.market)
         took = time.time() - t0
         if took > a.interval and n % 20 == 1:
             log(f"주의: 스캔 1회에 {took:.0f}초 — 간격({a.interval}초)을 넘습니다. "
@@ -904,7 +1063,44 @@ def main():
             log("장 종료 감지 → 루프 종료"); break
         time.sleep(max(2.0, a.interval - (time.time() - t0)))
     save_state(a.market, st)
-    log(f"루프 종료 — {n}회 스캔, 알림 {sent}건")
+    tail = ""
+    if paper_on(a.market):
+        _, bk = paper_ctx()
+        if bk is not None:
+            tail = f", 보유 {len(bk.get('positions') or {})}종목"
+    log(f"루프 종료 — {n}회 스캔, 알림 {sent}건{tail}")
+
+
+def paper_probe() -> None:
+    """모의투자 연결 점검. 토큰·계좌·잔고까지만 확인하고 주문은 내지 않는다.
+    첫 설정에서 무엇이 틀렸는지를 한 번에 보려는 용도다."""
+    P = _paper_mod()
+    if P is None:
+        log("paper.py 가 저장소에 없습니다 — 파일을 올렸는지 확인하세요"); return
+    key, sec = env("KIS_PAPER_APP_KEY"), env("KIS_PAPER_APP_SECRET")
+    acct = env("KIS_PAPER_ACCOUNT")
+    if not (key and sec and acct):
+        miss = [k for k, v in (("KIS_PAPER_APP_KEY", key), ("KIS_PAPER_APP_SECRET", sec),
+                               ("KIS_PAPER_ACCOUNT", acct)) if not v]
+        log(f"모의투자 설정 없음 — 비어 있는 시크릿: {', '.join(miss)}"); return
+    pk = P.PaperKIS(key, sec, acct, state_dir=STATE_DIR, log=log)
+    log(f"모의계좌 {pk.cano[:4]}**** / 상품코드 {pk.prod}")
+    if not pk.token():
+        log("토큰 발급 실패 → 위 오류 메시지를 확인하세요"); return
+    log("토큰 발급 성공")
+    bal = pk.balance()
+    if bal is None:
+        log("잔고조회 실패 → 계좌번호나 모의투자 신청 상태를 확인하세요"); return
+    cash = pk.cash()
+    log(f"잔고조회 성공 — 보유 {len(bal)}종목" +
+        (f", 주문가능현금 {cash:,.0f}원" if cash is not None else ""))
+    for c, v in list(bal.items())[:10]:
+        log(f"  {c} {v['qty']:,}주 @ {v['avg']:,.0f} ({v['pnl_pct']:+.2f}%)")
+    bk = P.load_book(STATE_DIR)
+    log(f"장부 — 대기 {len(bk.get('pending') or {})}건, "
+        f"보유 {len(bk.get('positions') or {})}종목, "
+        f"청산이력 {len(bk.get('closed') or [])}건")
+    log("연결 정상. 실제 주문은 텔레그램 버튼을 눌렀을 때만 나갑니다.")
 
 
 if __name__ == "__main__":
