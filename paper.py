@@ -64,6 +64,12 @@ class PaperKIS:
         # 눈에 안 보이는 문자가 섞여 들어오는 일이 잦다.
         digits = re.sub(r"\D", "", account or "")
         self.acc_len = len(digits)
+        # 화면에 7자리로 보이는 계좌가 있다. 선행 0 이 표시에서 떨어진 경우라
+        # 0 을 채워 8자리로 만들어 본다. 막아 버리면 시험조차 못 해서, 정작
+        # 그 계좌가 맞는지 확인할 방법이 없어진다.
+        self.padded = len(digits) in (7, 9) and len(digits) % 2 == 1
+        if self.padded:
+            digits = digits.zfill(8 if len(digits) == 7 else 10)
         self.cano, self.prod = digits[:8], (digits[8:10] or prod_cd)
         self.state_dir, self.log = state_dir, log
         self._tok, self._exp = "", 0.0
@@ -121,6 +127,8 @@ class PaperKIS:
         들어왔는지는 말해 주지 않는다. 그래서 보내기 전에 여기서 먼저 잡는다."""
         if self.acc_len == 0:
             return "계좌번호가 비어 있습니다"
+        if self.acc_len in (7, 9):
+            return ""          # 0 을 채워 진행한다 (경고는 probe 가 따로 찍는다)
         if self.acc_len not in (8, 10):
             return (f"계좌번호 숫자가 {self.acc_len}자리입니다 — "
                     "8자리(계좌) 또는 10자리(계좌8+상품코드2)여야 합니다")
@@ -212,7 +220,9 @@ class PaperKIS:
         if r.status_code != 200 or str(j.get("rt_cd", "1")) != "0":
             if not quiet:
                 self._fail("잔고조회", r, j)
-            return None, str(j.get("msg_cd") or f"HTTP{r.status_code}")
+            code = str(j.get("msg_cd") or f"HTTP{r.status_code}")
+            msg = str(j.get("msg1") or "").strip()[:60]
+            return None, (f"{code} {msg}" if msg else code)
         return j, ""
 
     def balance(self) -> dict[str, dict] | None:
@@ -254,8 +264,11 @@ class PaperKIS:
         모의투자 첫 설정에서 막히는 지점이 거의 여기다. 오류코드 하나만 보고는
         '파라미터가 틀렸나, 계좌가 틀렸나' 를 가릴 수 없어서, 조합을 직접
         돌려 보고 결과를 나란히 보여 준다."""
+        # 상품코드는 계좌 유형마다 다르고 화면에 안 보이는 경우가 많다.
+        # 잔고조회는 읽기 전용이라 몇 개 훑어봐도 위험이 없고, 한 번에 훑는 편이
+        # '바꿔서 다시 돌려보세요' 를 반복하는 것보다 빠르다.
         lines, combos, seen = [], [], set()
-        for prod in (self.prod, "01"):
+        for prod in (self.prod, "01", "02", "03", "22"):
             for ofl in self.BAL_OFL:
                 if (prod, ofl) not in seen:
                     seen.add((prod, ofl))
