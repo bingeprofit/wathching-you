@@ -114,7 +114,11 @@ SYSTEM = """당신은 장중 급등락 원인을 즉시 파악해 트레이더�
 {"items":[{"ticker":"...","cause":"...","context":"...",
 "sources":[{"title":"...","url":"...","date":"YYYY-MM-DD"}],
 "confidence":"high"|"medium"|"low"}]}
-cause 는 1~2문장, context 는 그 종목의 사업·테마 배경 1문장. 한국어로 쓴다."""
+cause 는 1~2문장, context 는 그 종목의 사업·테마 배경 1문장. 한국어로 쓴다.
+
+[JSON 을 깨뜨리지 않기 위한 규칙]
+문자열 값 안에 큰따옴표(")를 절대 쓰지 마라. 인용이 필요하면 작은따옴표를 써라.
+줄바꿈도 넣지 마라. 각 값은 한 줄로 이어 쓴다."""
 
 
 # ── 상태 (GitHub Actions 캐시로 실행 간 유지) ─────────────────────────────
@@ -666,13 +670,71 @@ def attribute(picks: list[dict], market: str) -> dict:
     u = msg.usage
     log(f"귀인: 검색 {getattr(getattr(u,'server_tool_use',None),'web_search_requests',0) or 0}회, "
         f"토큰 in {getattr(u,'input_tokens',0):,} / out {getattr(u,'output_tokens',0):,}")
-    mm = re.search(r"\{.*\}", text, re.S)
+    items = parse_items(text, stop=getattr(msg, "stop_reason", None))
+    return {i.get("ticker"): i for i in items if i.get("ticker")}
+
+
+def _repair_json(raw: str) -> str:
+    """모델이 흔히 내는 사소한 흠을 고친다. 내용은 건드리지 않는다."""
+    s = re.sub(r",\s*([}\]])", r"\1", raw)          # 뒤따르는 쉼표
+    s = re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f]", "", s)
+    # 문자열 안에 그대로 들어온 줄바꿈 (JSON 에서는 불법)
+    out, inside, esc = [], False, False
+    for ch in s:
+        if esc:
+            out.append(ch); esc = False; continue
+        if ch == "\\":
+            out.append(ch); esc = True; continue
+        if ch == '"':
+            inside = not inside
+        if inside and ch in "\r\n":
+            out.append(" "); continue
+        out.append(ch)
+    return "".join(out)
+
+
+def _salvage_items(raw: str) -> list[dict]:
+    """JSON 으로 못 읽을 때 항목을 하나씩 긁어낸다.
+
+    원인 분석을 다 받아 놓고 따옴표 하나 때문에 4건을 통째로 버리는 것보다,
+    읽히는 만큼이라도 건지는 편이 낫다. 알림은 이미 나가기로 정해진 상태다."""
+    out, marks = [], [m.start() for m in re.finditer(r'"ticker"\s*:', raw)]
+    for i, st in enumerate(marks):
+        seg = raw[st: marks[i + 1] if i + 1 < len(marks) else len(raw)]
+        t = re.search(r'"ticker"\s*:\s*"([^"]+)"', seg)
+        if not t:
+            continue
+        def grab(key):
+            g = re.search(rf'"{key}"\s*:\s*"(.*?)"\s*(?:,\s*"|\}}|\]|$)', seg, re.S)
+            return re.sub(r"\s+", " ", g.group(1)).strip() if g else ""
+        it = {"ticker": t.group(1), "cause": grab("cause"), "context": grab("context"),
+              "confidence": (re.search(r'"confidence"\s*:\s*"(\w+)"', seg) or [None, ""])[1]}
+        it["sources"] = [{"url": u} for u in re.findall(r'"url"\s*:\s*"(https?://[^"]+)"', seg)[:2]]
+        if it["cause"]:
+            out.append(it)
+    return out
+
+
+def parse_items(text: str, stop=None) -> list[dict]:
+    """모델 출력에서 items 를 꺼낸다. 깨끗한 JSON → 수선 → 부분 회수 순으로 시도."""
+    t = re.sub(r"```(?:json)?", "", text).strip()
+    mm = re.search(r"\{.*\}", t, re.S)
     if not mm:
-        log(f"귀인 응답에 JSON 없음 (stop={getattr(msg,'stop_reason',None)})"); return {}
-    try:
-        return {i.get("ticker"): i for i in json.loads(mm.group(0)).get("items", [])}
-    except json.JSONDecodeError as e:
-        log(f"귀인 JSON 파싱 실패: {e}"); return {}
+        log(f"귀인 응답에 JSON 없음 (stop={stop}) 앞부분: {t[:120]!r}")
+        return []
+    raw = mm.group(0)
+    for cand in (raw, _repair_json(raw)):
+        try:
+            got = json.loads(cand).get("items", [])
+            if isinstance(got, list):
+                return got
+        except json.JSONDecodeError as e:
+            err, pos = e, e.pos
+    salvaged = _salvage_items(raw)
+    # 무엇 때문에 깨졌는지 보이도록 문제 지점 주변을 남긴다
+    log(f"귀인 JSON 파싱 실패: {err} — 부분 회수 {len(salvaged)}건. "
+        f"문제 부근: {raw[max(0, pos - 60):pos + 60]!r}")
+    return salvaged
 
 
 # ── 알림 ─────────────────────────────────────────────────────────────────
@@ -713,7 +775,8 @@ def render(picks: list[dict], attrib: dict, market: str) -> str:
         tg = f" `{r['trigger']}`" if r.get("trigger") else ""
         out.append(f"*{lab}*  {r['pct']:+.1f}%  ({' · '.join(bits)}){tg} "
                    f"{mark.get(str(a.get('confidence','')).lower(),'')}")
-        out.append(f"  {a.get('cause','원인 미조회')}")
+        # get(k, 기본값) 은 값이 빈 문자열일 때 기본값을 안 준다 → 빈 줄이 찍힌다
+        out.append(f"  {a.get('cause') or '원인 미조회'}")
         if a.get("context"):
             out.append(f"  ↳ {a['context']}")
         for s in (a.get("sources") or [])[:2]:
