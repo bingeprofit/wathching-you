@@ -58,6 +58,16 @@ CFG = {
     "MAX_PER_HOUR":  int(env("MAX_PER_HOUR", "8")),       # 시간당 상한 (루프 폭주 방어)
     "MAX_PER_DAY":   int(env("MAX_PER_DAY", "40")),       # 하루 상한 (API 비용 방어)
     "COOLDOWN_MIN":  int(env("COOLDOWN_MIN", "120")),     # 같은 종목 재알림 금지 시간(분)
+    # ── 체결 가능성 필터 (한국만) ────────────────────────────────────────
+    # 급등률 순위 상위는 가벼운 종목이 지배한다. 호가가 얇으면 +20% 가 몇 억으로
+    # 만들어지고, 사러 들어가는 순간 그 폭이 사라진다. z 는 변동성으로 정규화할 뿐
+    # **유동성**은 보지 않으므로, 여기서 따로 건다.
+    #
+    # 거래대금은 하루가 갈수록 쌓이므로 절대값으로 자르면 아침엔 가혹하고 오후엔
+    # 헐겁다. 그래서 '지금 속도면 종가에 얼마가 될지' 로 환산해 비교한다.
+    "MIN_TURNOVER_KRW": float(env("MIN_TURNOVER_KRW", "5e9")),   # 일 환산 거래대금 하한(원)
+    "MIN_PRICE_KRW":    float(env("MIN_PRICE_KRW", "1000")),     # 주가 하한 (호가단위 노이즈 방어)
+    "MAX_SD_PCT":       float(env("MAX_SD_PCT", "0")),           # 일간 σ 상한(%). 0 이면 끔
     "SEARCH_PER_NAME": int(env("SEARCH_PER_NAME", "2")),
     "MODEL":         env("ATTRIB_MODEL", "claude-sonnet-5"),
     "MAX_TOKENS":    int(env("ATTRIB_MAX_TOKENS", "8000")),
@@ -685,13 +695,47 @@ def scan_us(universe: str = "focus") -> list[dict]:
 
 
 # ── 선별 ─────────────────────────────────────────────────────────────────
+def too_thin(r: dict) -> str:
+    """체결하기 어려운 종목이면 그 이유를, 아니면 빈 문자열.
+
+    **데이터가 없으면 거르지 않는다.** 거래대금 필드가 안 실려 온 종목까지
+    막아 버리면, 필드 하나 빠진 날 알림이 통째로 멈추고 그 사실조차 모른다.
+    필터는 값이 있을 때만 작동하고, 없으면 통과시킨 뒤 로그로 드러낸다."""
+    if r.get("market") == "us" or r.get("excd"):     # 한국 종목에만 적용
+        return ""
+    px = float(r.get("last") or 0)
+    lo = CFG["MIN_PRICE_KRW"]
+    if lo and 0 < px < lo:
+        return f"주가 {lo:,.0f}원 미만"
+
+    val = float(r.get("value") or 0)
+    need = CFG["MIN_TURNOVER_KRW"]
+    if need and val > 0:
+        # 지금까지 쌓인 거래대금을 하루 전체로 환산한다. 장 초반 몇 분은
+        # 분모가 너무 작아 아무 종목이나 통과하므로 하한을 둔다.
+        frac = max(elapsed_frac(r.get("market") or "kr"), 0.08)
+        if val / frac < need:
+            return f"일환산 거래대금 {need / 1e8:,.0f}억 미만"
+
+    cap = CFG["MAX_SD_PCT"]
+    sd = r.get("sd_daily")
+    if cap and sd and sd * 100 > cap:
+        return f"일간 변동성 {cap:g}% 초과"
+    return ""
+
+
 def pick(rows: list[dict], st: dict, limit: int) -> list[dict]:
     """두 경로 중 하나라도 걸리면 알린다.
       (A) 일중 누적: 절대 등락률 + 일간변동성 대비 z + 거래량 동반
       (B) 순간 급변: 최근 N분 변동이 그 구간 기준으로 이례적 + 그 구간 거래량 동반"""
     out = []
+    thin = {}
     for r in rows:
         if on_cooldown(st, r["ticker"]):
+            continue
+        why = too_thin(r)
+        if why:
+            thin[why] = thin.get(why, 0) + 1
             continue
         def ok(vr):
             return (not (vr is not None and vr == vr)) or vr >= CFG["VOL_RATIO_MIN"]
@@ -724,6 +768,11 @@ def pick(rows: list[dict], st: dict, limit: int) -> list[dict]:
     out.sort(key=lambda x: (0 if "급변" in x.get("trigger", "") else 1,
                             -abs((x.get("z_burst") if "급변" in x.get("trigger", "")
                                   else x.get("z")) or 0)))
+    # 필터가 실제로 무엇을 얼마나 잘랐는지 남긴다. 임계는 감이 아니라 이 숫자와
+    # signals.jsonl 을 보고 조정해야 한다. 아무것도 안 잘리면 필터는 없는 셈이고,
+    # 다 잘리면 알림이 사라진 이유가 여기 있다.
+    if thin:
+        log("체결성 필터: " + ", ".join(f"{k} {v}건" for k, v in sorted(thin.items())))
     return out[:limit]
 
 

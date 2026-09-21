@@ -37,6 +37,31 @@ US_EXCHANGES = ["NAS", "NYS", "AMS"]     # 나스닥 / 뉴욕 / 아멕스
 # 잠깐 실패했다가 다시 물으면 되는 오류들 (KIS 안내 문구가 "재조회"인 것)
 TRANSIENT = {"EGW00316"}
 
+# ── 연결 재사용 ──────────────────────────────────────────────────────────
+# requests.get() 은 호출마다 새 TCP 연결을 연다. 60초마다 수십 종목을 훑는
+# 이 루프에서는 그게 분당 수백 번의 핸드셰이크가 되고, KIS 는 어느 선을 넘으면
+# 응답 없이 연결을 끊어 버린다 (RemoteDisconnected). 세션 하나를 재사용하면
+# 핸드셰이크가 사라져 그 압력이 크게 줄어든다.
+#
+# 다만 테스트는 requests.get/post 를 갈아끼워 응답을 흉내 낸다. 그래서 '진짜
+# requests 함수일 때만' 세션으로 바꿔 탄다 — 갈아끼워져 있으면 그대로 부른다.
+_SESSION = requests.Session()
+_REAL = {"get": requests.get, "post": requests.post}
+
+
+def http(method: str, url: str, **kw):
+    fn = getattr(requests, method)
+    if fn is _REAL.get(method):
+        fn = getattr(_SESSION, method)
+    return fn(url, **kw)
+
+
+# 연결이 끊기는 것은 서버가 바빠서지 요청이 틀려서가 아니다. 조회(GET)는
+# 몇 번을 다시 물어도 부작용이 없으므로 짧게 쉬었다 다시 묻는다.
+NET_ERRORS = (requests.exceptions.ConnectionError,
+              requests.exceptions.Timeout,
+              requests.exceptions.ChunkedEncodingError)
+
 
 def _f(o: dict, k: str, d: float = 0.0) -> float:
     try:
@@ -97,7 +122,7 @@ class KIS:
                     return self._tok
             except Exception:
                 pass
-        r = requests.post(f"{self.base}/oauth2/tokenP", timeout=20,
+        r = http("post", f"{self.base}/oauth2/tokenP", timeout=20,
                           json={"grant_type": "client_credentials",
                                 "appkey": self.key, "appsecret": self.sec})
         try:
@@ -140,7 +165,17 @@ class KIS:
              "appsecret": self.sec, "tr_id": tr_id, "custtype": "P",
              "content-type": "application/json; charset=utf-8"}
         try:
-            r = requests.get(f"{self.base}{path}", headers=h, params=params, timeout=timeout)
+            r = http("get", f"{self.base}{path}", headers=h, params=params, timeout=timeout)
+        except NET_ERRORS as e:
+            # 연결이 끊긴 것뿐이면 조회는 다시 물어도 된다. 한 종목이 통째로
+            # 빠지면 그 종목만 스캔에 구멍이 나므로, 두 번까지는 되묻는다.
+            if _retry < 2:
+                time.sleep(0.4 * (_retry + 1))
+                return self._get(path, tr_id, params, timeout, _retry + 1)
+            self._log_once((tr_id, "net"),
+                           f"KIS 통신 실패 [{tr_id}]: {type(e).__name__} {str(e)[:120]} "
+                           f"(재시도 {_retry}회 후 포기)")
+            return {}
         except Exception as e:
             self._log_once((tr_id, "net"), f"KIS 통신 실패 [{tr_id}]: {type(e).__name__} {str(e)[:120]}")
             return {}

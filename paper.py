@@ -26,8 +26,27 @@ PAPER_BASE = "https://openapivts.koreainvestment.com:29443"
 
 # 신 TR (모의투자는 앞에 V). 실전은 T 로 시작하지만 이 파일은 모의 전용이다.
 TR_BUY, TR_SELL, TR_BAL = "VTTC0012U", "VTTC0011U", "VTTC8434R"
+TR_CCLD = "VTTC8001R"                    # 주식일별주문체결조회 (주문이 들어갔는지 확인)
 # 토큰이 죽었을 때 나오는 코드들. 캐시를 버리고 한 번 다시 받으면 된다.
 TOKEN_DEAD = {"EGW00123", "EGW00121", "EGW00105"}
+
+# ── 연결 재사용 ──────────────────────────────────────────────────────────
+# kis.py 와 같은 이유. 호출마다 새 연결을 열면 KIS 가 어느 선에서 응답 없이
+# 연결을 끊는다. 테스트가 requests 를 갈아끼운 경우에는 그대로 통과시킨다.
+_SESSION = requests.Session()
+_REAL = {"get": requests.get, "post": requests.post}
+
+
+def http(method: str, url: str, **kw):
+    fn = getattr(requests, method)
+    if fn is _REAL.get(method):
+        fn = getattr(_SESSION, method)
+    return fn(url, **kw)
+
+
+NET_ERRORS = (requests.exceptions.ConnectionError,
+              requests.exceptions.Timeout,
+              requests.exceptions.ChunkedEncodingError)
 
 
 def _f(d: dict, k: str) -> float:
@@ -110,7 +129,7 @@ class PaperKIS:
         except Exception:
             pass
         try:
-            r = requests.post(f"{PAPER_BASE}/oauth2/tokenP", timeout=20,
+            r = http("post", f"{PAPER_BASE}/oauth2/tokenP", timeout=20,
                               json={"grant_type": "client_credentials",
                                     "appkey": self.key, "appsecret": self.sec})
             j = r.json()
@@ -163,7 +182,7 @@ class PaperKIS:
         시도한다 — 해시 없이도 받아 주는 구간이 있어서, 여기서 멈추면
         '왜 주문이 안 나가는지' 를 모르게 된다."""
         try:
-            r = requests.post(f"{PAPER_BASE}/uapi/hashkey", timeout=10, json=body,
+            r = http("post", f"{PAPER_BASE}/uapi/hashkey", timeout=10, json=body,
                               headers={"content-type": "application/json; charset=utf-8",
                                        "appkey": self.key, "appsecret": self.sec})
             return r.json().get("HASH", "")
@@ -207,10 +226,34 @@ class PaperKIS:
         tr = TR_BUY if side == "buy" else TR_SELL
         hk = self._hashkey(body)
         try:
-            r = requests.post(f"{PAPER_BASE}/uapi/domestic-stock/v1/trading/order-cash",
-                              timeout=20, json=body,
-                              headers=self._headers(tr, {"hashkey": hk} if hk else None))
+            r = http("post", f"{PAPER_BASE}/uapi/domestic-stock/v1/trading/order-cash",
+                     timeout=20, json=body,
+                     headers=self._headers(tr, {"hashkey": hk} if hk else None))
             j = r.json()
+        except NET_ERRORS as e:
+            # **주문은 함부로 다시 보내지 않는다.** 연결이 끊겼다는 것은 응답을
+            # 못 받았다는 뜻일 뿐, 주문이 안 들어갔다는 뜻이 아니다. 그냥 재시도하면
+            # 같은 종목을 두 번 살 수 있다. 먼저 체결내역으로 들어갔는지 확인하고,
+            # 확실히 안 들어간 경우에만 한 번 다시 보낸다.
+            self.log(f"모의 주문 통신 실패 [{code}]: {type(e).__name__} {str(e)[:120]}")
+            landed = self.order_landed(code, side)
+            if landed is True:
+                self.last_err = ""
+                self.log(f"  → 체결내역에 주문이 있습니다 — 재전송하지 않습니다 [{code}]")
+                return {"ord_no": "", "org": "", "tmd": "",
+                        "msg": "통신은 끊겼지만 주문은 접수됨"}
+            if landed is None or _retry:
+                # 확인 자체가 실패했거나 이미 한 번 다시 보냈다. 중복 매수보다
+                # 놓친 매수가 낫다 — 여기서 멈추고 사람이 판단하게 한다.
+                self.last_err = ("통신 실패 — 주문 여부 확인 불가, 재전송 안 함"
+                                 if landed is None else f"통신 실패 {type(e).__name__}")
+                if landed is None:
+                    self.log(f"  → 주문 여부를 확인하지 못했습니다 — 중복 방지를 위해 "
+                             f"재전송하지 않습니다 [{code}]. 모의계좌에서 직접 확인하세요")
+                return None
+            self.log(f"  → 체결내역에 없습니다 — 한 번만 다시 보냅니다 [{code}]")
+            time.sleep(0.8)
+            return self.order(code, qty, side, ord_dvsn, price, _retry=True)
         except Exception as e:
             self.last_err = f"통신 실패 {type(e).__name__}"
             self.log(f"모의 주문 통신 실패 [{code}]: {type(e).__name__} {str(e)[:120]}")
@@ -224,6 +267,52 @@ class PaperKIS:
         o = j.get("output") or {}
         return {"ord_no": o.get("ODNO") or "", "org": o.get("KRX_FWDG_ORD_ORGNO") or "",
                 "tmd": o.get("ORD_TMD") or "", "msg": str(j.get("msg1") or "")[:60]}
+
+    def order_landed(self, code: str, side: str = "buy",
+                     within_sec: int = 180) -> bool | None:
+        """방금 낸 주문이 실제로 접수됐는지. True/False, **모르면 None**.
+
+        통신이 끊겼을 때 재전송해도 되는지 판단하는 유일한 근거다. 그래서
+        '확인 실패' 를 '주문 없음' 으로 뭉뚱그리지 않는다 — 그렇게 하면 확인이
+        안 될 때마다 중복 주문을 내게 된다. 모르면 모른다고 답하고, 호출부는
+        모를 때 재전송하지 않는다."""
+        today = dt.datetime.now(KST).strftime("%Y%m%d")
+        params = {"CANO": self.cano, "ACNT_PRDT_CD": self.prod,
+                  "INQR_STRT_DT": today, "INQR_END_DT": today,
+                  "SLL_BUY_DVSN_CD": "02" if side == "buy" else "01",
+                  "INQR_DVSN": "00", "PDNO": code, "CCLD_DVSN": "00",
+                  "ORD_GNO_BRNO": "", "ODNO": "", "INQR_DVSN_3": "00",
+                  "INQR_DVSN_1": "", "CTX_AREA_FK100": "", "CTX_AREA_NK100": ""}
+        try:
+            r = http("get",
+                     f"{PAPER_BASE}/uapi/domestic-stock/v1/trading/inquire-daily-ccld",
+                     timeout=15, params=params, headers=self._headers(TR_CCLD))
+            j = r.json()
+        except Exception as e:
+            self.log(f"주문 확인 조회 실패 [{code}]: {type(e).__name__} {str(e)[:80]}")
+            return None
+        if r.status_code != 200 or str(j.get("rt_cd", "1")) != "0":
+            self.log(f"주문 확인 조회 거절 [{code}]: "
+                     f"{j.get('msg_cd')} {str(j.get('msg1'))[:60]}")
+            return None
+        rows = j.get("output1")
+        if rows is None:
+            return None                       # 응답 모양이 예상과 다르다 = 모름
+        now = dt.datetime.now(KST)
+        for o in rows:
+            if str(o.get("pdno") or "").zfill(6) != str(code).zfill(6):
+                continue
+            tmd = str(o.get("ord_tmd") or "")
+            if len(tmd) != 6:
+                return True                   # 시각을 못 읽어도 주문은 있다
+            try:
+                t = now.replace(hour=int(tmd[:2]), minute=int(tmd[2:4]),
+                                second=int(tmd[4:6]), microsecond=0)
+            except ValueError:
+                return True
+            if 0 <= (now - t).total_seconds() <= within_sec:
+                return True
+        return False
 
     # OFL_YN 은 문서상 공란인데, 모의 서버가 공란을 거부하고 "N" 을 요구하는
     # 사례가 보고돼 있다. 어느 쪽이 맞는지 실호출 전에는 알 수 없어, 처음 한 번은
@@ -241,7 +330,7 @@ class PaperKIS:
                  _retry: int = 0):
         """(응답 dict 또는 None, 오류코드). 진단용으로 오류코드를 함께 돌려준다."""
         try:
-            r = requests.get(f"{PAPER_BASE}/uapi/domestic-stock/v1/trading/inquire-balance",
+            r = http("get", f"{PAPER_BASE}/uapi/domestic-stock/v1/trading/inquire-balance",
                              timeout=20, params=self._bal_params(ofl, prod),
                              headers=self._headers(TR_BAL))
             j = r.json()
@@ -282,7 +371,7 @@ class PaperKIS:
              "PDNO": "005930", "ORD_UNPR": "0", "ORD_DVSN": "01",
              "CMA_EVLU_AMT_ICLD_YN": "N", "OVRS_ICLD_YN": "N"}
         try:
-            r = requests.get(f"{PAPER_BASE}/uapi/domestic-stock/v1/trading/inquire-psbl-order",
+            r = http("get", f"{PAPER_BASE}/uapi/domestic-stock/v1/trading/inquire-psbl-order",
                              timeout=20, params=p, headers=self._headers("VTTC8908R"))
             j = r.json()
         except Exception as e:
