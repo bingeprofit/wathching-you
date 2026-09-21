@@ -82,6 +82,9 @@ CFG = {
     "APPROVE_TTL_MIN":  int(env("APPROVE_TTL_MIN", "15")),
     "HOLD_DAYS":        int(env("HOLD_DAYS", "5")),      # 시간청산: T+N 영업일
     "STOP_SD":          float(env("STOP_SD", "1.5")),    # 손절: 진입가 -N×일간σ
+    # 익절: 진입가 +N%. 0 이면 끄고 시간청산·손절만 쓴다. 어느 수준이 맞는지는
+    # 아직 모르므로, backfill 이 여러 수준을 동시에 시뮬레이션해 근거를 만든다.
+    "TAKE_PROFIT_PCT":  float(env("TAKE_PROFIT_PCT", "5.0")),
     "MAX_POSITIONS":    int(env("MAX_POSITIONS", "5")),
     # 왕복 거래비용(%) — 증권거래세 0.15% + 수수료 + 급변 종목 슬리피지 가정.
     # 모의투자는 슬리피지 없이 체결되므로 빼 줘야 실전에 가까운 수익률이 된다.

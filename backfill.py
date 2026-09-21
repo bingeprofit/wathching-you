@@ -29,6 +29,53 @@ SIG = os.path.join(STATE_DIR, "signals.jsonl")
 # 왕복 거래비용(%). 증권거래세 0.15% + 수수료 + 급변 종목 슬리피지 가정.
 COST = float((os.environ.get("ROUND_TRIP_PCT") or "0.55").strip())
 NO_EVENT = "확인된 촉발 사건 없음"
+# 시뮬레이션할 익절 수준(%). 0 은 "익절 없음" — 시간청산·손절만 쓰는 기준선이다.
+# 어느 수준이 맞는지 미리 고를 수 없으니, 전부 돌려 두고 데이터가 고르게 한다.
+TP_GRID = [float(x) for x in (os.environ.get("TP_GRID") or "0,3,5,8,12").split(",")]
+STOP_SD = float((os.environ.get("STOP_SD") or "1.5").strip())
+HOLD_DAYS = int((os.environ.get("HOLD_DAYS") or "5").strip())
+
+
+def sim_exit(entry: float, bars: list[dict], tp_pct: float,
+             sl_pct: float, hold: int) -> dict | None:
+    """일봉 경로로 익절·손절·시간청산을 재현한다. bars[0] 이 알림 당일(D0).
+
+    D0 은 **종가만** 본다. 진입이 장중이라 그날 고가·저가에는 진입 전 구간이
+    섞여 있고, 그걸 쓰면 사지도 않은 가격에 익절한 것으로 기록된다.
+    종가가 이미 목표를 넘겼다면 진입 후 어느 시점엔가 반드시 통과했으므로
+    그것만 인정한다. 장중에 찍고 되돌아온 경우는 놓치는데, 성과를 부풀리는
+    방향이 아니라 깎는 방향이라 그대로 둔다.
+
+    같은 날 고가·저가가 익절선과 손절선을 모두 건드리면 순서를 알 수 없다.
+    **손절이 먼저 닿았다고 본다** — 역시 부풀리지 않는 쪽이다."""
+    if entry <= 0 or not bars:
+        return None
+    tp = entry * (1 + tp_pct / 100) if tp_pct > 0 else None
+    sl = entry * (1 - sl_pct / 100) if sl_pct > 0 else None
+
+    for i, b in enumerate(bars[:hold + 1]):
+        c = float(b.get("close") or 0)
+        if i == 0:
+            hi = lo = c                      # D0 은 종가만
+        else:
+            hi = float(b.get("high") or c) or c
+            lo = float(b.get("low") or c) or c
+        if not c:
+            continue
+        hit_sl = bool(sl and lo and lo <= sl)
+        hit_tp = bool(tp and hi and hi >= tp)
+        if hit_sl:
+            return {"ret": round(-sl_pct, 3), "day": i,
+                    "why": "손절+익절 동일봉" if hit_tp else "손절"}
+        if hit_tp:
+            return {"ret": round(tp_pct, 3), "day": i, "why": "익절"}
+
+    last = bars[min(hold, len(bars) - 1)]
+    lc = float(last.get("close") or 0)
+    if lc <= 0:
+        return None
+    return {"ret": round((lc / entry - 1) * 100, 3),
+            "day": min(hold, len(bars) - 1), "why": "시간청산"}
 
 
 def log(*a):
@@ -70,7 +117,8 @@ def fill(rows: list[dict]) -> int:
         log("KIS 키 미설정 → 수익률 채우기 생략"); return 0
     api = KIS(key, sec, state_dir=STATE_DIR, log=log)
 
-    todo = [r for r in rows if r.get("r_t5") is None and r.get("px")]
+    todo = [r for r in rows if (r.get("r_t5") is None or not r.get("sim"))
+            and r.get("px")]
     if not todo:
         log("채울 행 없음"); return 0
 
@@ -112,6 +160,19 @@ def fill(rows: list[dict]) -> int:
         if r["r_t5"] is not None:
             r["r_t5_net"] = round(r["r_t5"] - COST, 3)
             r["r_t1_net"] = round(r["r_t1"] - COST, 3) if r["r_t1"] is not None else None
+            # 익절 수준별로 "그 규칙이었으면 어땠을까" 를 같이 남긴다.
+            # 손절선은 실제 운용과 같은 -STOP_SD×σ 를 쓴다.
+            sd = float(r.get("sd_daily") or 0.0)
+            sl_pct = STOP_SD * sd * 100 if sd > 0 else 0.0
+            sim = {}
+            for tp in TP_GRID:
+                out = sim_exit(px, after, tp, sl_pct, HOLD_DAYS)
+                if out:
+                    out["net"] = round(out["ret"] - COST, 3)
+                    sim[f"tp{tp:g}"] = out
+            if sim:
+                r["sim"] = sim
+                r["sl_pct"] = round(sl_pct, 3)
             filled += 1
     return filled
 
@@ -159,6 +220,38 @@ def summarize(rows: list[dict]) -> str:
     out.append("")
     cut("한국", lambda r: r.get("market") == "kr")
     cut("미국", lambda r: r.get("market") == "us")
+
+    # ── 익절 수준 비교 ─────────────────────────────────────────────────
+    # 이 표가 "몇 %에서 익절할 것인가" 에 답한다. 손절선은 실제 운용과 같은
+    # -1.5σ 로 고정하고 익절만 바꿔 가며 같은 표본에 적용한 결과다.
+    sims = [r for r in done if r.get("sim")]
+    if sims:
+        out += ["", "─" * 28, f"*익절 수준 비교* (n={len(sims)}, 손절 −{STOP_SD}σ 고정)",
+                "_비용 차감 기준. 0% 는 익절 없이 T+5·손절만_", ""]
+        rows = []
+        for tp in TP_GRID:
+            k = f"tp{tp:g}"
+            v = [r["sim"][k] for r in sims if r.get("sim", {}).get(k)]
+            if not v:
+                continue
+            nets = [x["net"] for x in v]
+            hit = sum(1 for x in v if x["why"] == "익절") / len(v) * 100
+            cut = sum(1 for x in v if x["why"].startswith("손절")) / len(v) * 100
+            days = statistics.fmean([x["day"] for x in v])
+            rows.append((statistics.fmean(nets), tp, len(v), hit, cut, days,
+                         sum(1 for x in nets if x > 0) / len(nets) * 100))
+        for avg, tp, n, hit, cut, days, win in rows:
+            # 한글은 반각 둘 폭이라 %>7 같은 정렬이 어긋난다. 라벨을 모두
+            # 같은 시각 폭(반각 8)으로 맞춰 둔다.
+            tag = "익절없음" if tp == 0 else f"익절{f'+{tp:g}%':>4}"
+            out.append(f"  `{tag}` 평균 {avg:+.2f}%  승률 {win:.0f}%  "
+                       f"(익절 {hit:.0f}% · 손절 {cut:.0f}%)  보유 {days:.1f}일")
+        if rows:
+            best = max(rows)
+            tag = "익절 없음" if best[1] == 0 else f"+{best[1]:g}% 익절"
+            out.append(f"  → 현재 표본 최선: *{tag}* (평균 {best[0]:+.2f}%)")
+            if len(sims) < 50:
+                out.append("  _표본 50건 전에는 순위가 계속 바뀝니다._")
 
     # ── 재량의 기여 ────────────────────────────────────────────────────
     try:

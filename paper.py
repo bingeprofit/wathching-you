@@ -494,17 +494,21 @@ def make_approver(pk: "PaperKIS", bk: dict, price_fn, cfg: dict, log=print):
 
         sd = float(pend.get("sd") or 0.0)
         stop = px * (1 - cfg["STOP_SD"] * sd) if sd > 0 else 0.0
+        tp = float(cfg.get("TAKE_PROFIT_PCT") or 0.0)
+        target = px * (1 + tp / 100) if tp > 0 else 0.0
         bk.setdefault("positions", {})[code] = {
             "name": pend["name"], "qty": qty, "entry": px,
             "entry_ts": int(time.time()),
             "entry_date": dt.datetime.now(KST).strftime("%Y%m%d"),
-            "sd": sd, "stop": stop, "trigger": pend.get("trigger") or "",
+            "sd": sd, "stop": stop, "target": target,
+            "trigger": pend.get("trigger") or "",
             "entry_pct": pend.get("pct"), "ord_no": o.get("ord_no", ""),
             "delay_min": round(age, 1)}
         drop = f"{stop:,.0f}원" if stop else "미설정(σ 없음)"
+        goal = f"익절 {target:,.0f}원(+{tp:.1f}%) · " if target else ""
         return (f"✅ *{pend['name']}* 매수 {qty:,}주 @ {px:,.0f}원 "
                 f"(약 {qty * px:,.0f}원)\n"
-                f"손절 {drop} · 시간청산 T+{cfg['HOLD_DAYS']}영업일 · "
+                f"{goal}손절 {drop} · 시간청산 T+{cfg['HOLD_DAYS']}영업일 · "
                 f"승인지연 {age:.1f}분")
 
     return on_approve
@@ -540,9 +544,15 @@ def check_exits(pk: "PaperKIS", bk: dict, price_fn, cfg: dict, log=print) -> lis
         q = price_fn(code) or {}
         px = float(q.get("last") or 0.0)
         held = weekdays_between(p.get("entry_date", ""))
+        ent = float(p.get("entry") or 0.0)
         reason = ""
+        # 손절을 먼저 본다. 같은 스캔에서 양쪽 조건이 다 맞는 경우는 장중에
+        # 위아래로 크게 흔들렸다는 뜻이고, 그때는 나쁜 쪽을 가정하는 편이
+        # 성과를 부풀리지 않는다.
         if px > 0 and p.get("stop") and px <= p["stop"]:
             reason = "손절"
+        elif px > 0 and p.get("target") and px >= p["target"]:
+            reason = "익절"
         elif held >= cfg["HOLD_DAYS"] and (hm >= 15 * 60 + 10 or held > cfg["HOLD_DAYS"]):
             reason = "시간청산"
         if not reason:
@@ -551,7 +561,6 @@ def check_exits(pk: "PaperKIS", bk: dict, price_fn, cfg: dict, log=print) -> lis
         if not o:
             log(f"{p.get('name', code)} 청산 주문 실패 — 다음 회차에 다시 시도합니다")
             continue
-        ent = float(p.get("entry") or 0.0)
         ret = (px / ent - 1) * 100 if (ent and px) else float("nan")
         # 왕복 거래비용: 증권거래세 0.15% + 수수료·슬리피지 가정. 모의투자는
         # 슬리피지 없이 체결되므로 이 값을 빼야 실전에 가깝다.

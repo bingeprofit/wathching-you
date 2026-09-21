@@ -228,8 +228,11 @@ class KIS:
                            "FID_PERIOD_DIV_CODE": "D", "FID_ORG_ADJ_PRC": "0"})
         except Exception:
             return []
+        # 고가·저가까지 받는다. 진입 뒤 어디까지 갔는지를 알아야 "몇 %에서
+        # 익절했으면 어땠을까" 를 사후에 계산할 수 있다.
         return [{"date": r.get("stck_bsop_date"), "close": _f(r, "stck_clpr"),
-                 "volume": _f(r, "acml_vol")}
+                 "high": _f(r, "stck_hgpr"), "low": _f(r, "stck_lwpr"),
+                 "open": _f(r, "stck_oprc"), "volume": _f(r, "acml_vol")}
                 for r in (j.get("output2") or []) if _f(r, "stck_clpr") > 0]
 
     # ── 해외 (미국) ─────────────────────────────────────────────────────
@@ -296,7 +299,9 @@ class KIS:
                            "GUBN": "0", "BYMD": "", "MODP": "1"})
         except Exception:
             return []
-        return [{"date": r.get("xymd"), "close": _f(r, "clos"), "volume": _f(r, "tvol")}
+        return [{"date": r.get("xymd"), "close": _f(r, "clos"),
+                 "high": _f(r, "high"), "low": _f(r, "low"), "open": _f(r, "open"),
+                 "volume": _f(r, "tvol")}
                 for r in (j.get("output2") or []) if _f(r, "clos") > 0]
 
     # ── 해외선물 ────────────────────────────────────────────────────────
