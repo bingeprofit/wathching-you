@@ -59,6 +59,11 @@ jobs:
           KIS_APP_KEY:      ${{ secrets.KIS_APP_KEY }}
           KIS_APP_SECRET:   ${{ secrets.KIS_APP_SECRET }}
           ROUND_TRIP_PCT:   "0.55"
+          # 익절 수준을 여러 개 동시에 시뮬레이션한다. 0 은 익절 없이
+          # T+5·손절만 쓰는 기준선. 손절선은 실제 운용과 같은 값을 쓴다.
+          TP_GRID:          "0,3,5,8,12"
+          STOP_SD:          "1.5"
+          HOLD_DAYS:        "5"
           STATE_DIR:        "state"
         run: |
           python backfill.py --send \
@@ -72,7 +77,11 @@ jobs:
           KIS_APP_SECRET:   ${{ secrets.KIS_APP_SECRET }}
           # 미국은 왕복 비용이 낮다 (증권거래세 없음, 수수료 + 슬리피지만).
           ROUND_TRIP_PCT:   "0.25"
+          TP_GRID:          "0,3,5,8,12"
+          STOP_SD:          "1.5"
+          HOLD_DAYS:        "5"
           STATE_DIR:        "state_us"
         run: |
           python backfill.py --send \
             ${{ github.event.inputs.attach == 'true' && '--attach' || '' }}
+
