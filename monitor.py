@@ -85,6 +85,12 @@ CFG = {
     # 익절: 진입가 +N%. 0 이면 끄고 시간청산·손절만 쓴다. 어느 수준이 맞는지는
     # 아직 모르므로, backfill 이 여러 수준을 동시에 시뮬레이션해 근거를 만든다.
     "TAKE_PROFIT_PCT":  float(env("TAKE_PROFIT_PCT", "5.0")),
+    # 상한가·하한가는 반대 호가가 없어 실전에서 체결이 안 된다. 승인해도
+    # 주문을 내지 않는다. 국내 가격제한폭이 ±30% 라 29.5 를 기준으로 둔다.
+    "PRICE_LIMIT_PCT":  float(env("PRICE_LIMIT_PCT", "29.5")),
+    # 주문 접수 후 잔고에 잡히기까지의 유예(초). 이 안에 잔고에 없어도
+    # 체결 대기로 보고 장부를 지우지 않는다.
+    "SETTLE_GRACE_SEC": float(env("SETTLE_GRACE_SEC", "600")),
     "MAX_POSITIONS":    int(env("MAX_POSITIONS", "5")),
     # 왕복 거래비용(%) — 증권거래세 0.15% + 수수료 + 급변 종목 슬리피지 가정.
     # 모의투자는 슬리피지 없이 체결되므로 빼 줘야 실전에 가까운 수익률이 된다.
@@ -336,6 +342,7 @@ def build_rows(api, market: str, cand: dict) -> list[dict]:
         pct = float(m.get("chg_pct") or 0.0)
         row = {"ticker": code, "name": m.get("name") or code, "excd": m.get("excd"),
                "last": last, "pct": pct, "sd_daily": sd, "session_min": smin,
+               "value": float(m.get("value") or 0.0),
                "z": (pct / 100) / sd if sd else 0.0,
                "vol_ratio": (vol / max(av * frac, 1.0)) if (av and frac > 0) else float("nan")}
         b, bv, span = hist_burst(f"{market}:{code}", bm)
@@ -787,6 +794,8 @@ def log_signals(picks: list[dict], attrib: dict, market: str) -> None:
                     "z": _num(r.get("z")), "sd_daily": _num(r.get("sd_daily")),
                     "burst": _num(r.get("burst")), "burst_min": _num(r.get("burst_min")),
                     "vol_ratio": _num(r.get("vol_ratio")),
+                    # 거래대금(원/달러). 소형주를 사후에 걸러내려면 이게 있어야 한다.
+                    "value": _num(r.get("value")),
                     "trigger": r.get("trigger"), "cause": a.get("cause"),
                     "confidence": a.get("confidence"),
                 }, ensure_ascii=False) + "\n")
@@ -930,6 +939,9 @@ def render(picks: list[dict], attrib: dict, market: str) -> str:
 
 
 # ── 실행 ─────────────────────────────────────────────────────────────────
+_BUDGET_SEEN: dict = {}
+
+
 def scan_once(market: str, st: dict, universe: str,
               ignore_hourly: bool = False) -> tuple[int, int]:
     """한 번 스캔하고 알릴 것이 있으면 보낸다. (보낸 건수, 스캔한 종목수)."""
@@ -940,9 +952,15 @@ def scan_once(market: str, st: dict, universe: str,
     lim = budget_left(st, ignore_hourly)
     if lim <= 0:
         used = len(st.get("log", []))
-        log(f"알림 예산 소진 (시간당 {CFG['MAX_PER_HOUR']} / 일 {CFG['MAX_PER_DAY']}, "
-            f"오늘 {used}건 사용) → 대기. 수동 테스트는 --force 로 시간당 상한을 건너뜁니다")
+        # 60초 루프에서 매 회차 같은 줄을 찍으면 로그가 이것만으로 채워져
+        # 정작 봐야 할 오류가 묻힌다. 사용량이 바뀔 때만 한 번 알린다.
+        if _BUDGET_SEEN.get("used") != used:
+            _BUDGET_SEEN["used"] = used
+            log(f"알림 예산 소진 (시간당 {CFG['MAX_PER_HOUR']} / 일 "
+                f"{CFG['MAX_PER_DAY']}, 오늘 {used}건 사용) → 상한이 풀릴 때까지 대기. "
+                "수동 테스트는 --force 로 시간당 상한을 건너뜁니다")
         return 0, len(rows)
+    _BUDGET_SEEN.pop("used", None)
     picks = pick(rows, st, lim)
     if not picks:
         return 0, len(rows)

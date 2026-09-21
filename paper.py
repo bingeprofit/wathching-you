@@ -77,6 +77,7 @@ class PaperKIS:
         self._tok, self._exp = "", 0.0
         self._seen: set = set()
         self._bal_ofl: str | None = None      # 통하는 OFL_YN 값 (첫 조회에서 확정)
+        self.last_err = ""                    # 마지막 주문 실패 사유 (텔레그램 회신용)
 
     # ── 토큰 ────────────────────────────────────────────────────────────
     def _token_path(self) -> str:
@@ -177,13 +178,18 @@ class PaperKIS:
         h.update(extra or {})
         return h
 
-    def _fail(self, what: str, r, j: dict) -> None:
+    def _fail(self, what: str, r, j: dict) -> str:
+        """실패 사유를 로그에 한 번 남기고, 사람이 읽을 문장으로 돌려준다.
+
+        로그에만 남기면 텔레그램에는 '실패 — 로그를 확인하세요' 밖에 못 쓴다.
+        장중에 Actions 로그를 뒤지게 만드는 것은 설계 실패다."""
         code = str(j.get("msg_cd") or "")
         msg = str(j.get("msg1") or r.text)[:200]
         sig = (what, r.status_code, code)
         if sig not in self._seen:
             self._seen.add(sig)
             self.log(f"모의 {what} 실패 HTTP {r.status_code} {code}: {msg}")
+        return f"{msg} ({code})" if code else msg
 
     # ── 주문 ────────────────────────────────────────────────────────────
     def order(self, code: str, qty: int, side: str = "buy",
@@ -206,13 +212,14 @@ class PaperKIS:
                               headers=self._headers(tr, {"hashkey": hk} if hk else None))
             j = r.json()
         except Exception as e:
+            self.last_err = f"통신 실패 {type(e).__name__}"
             self.log(f"모의 주문 통신 실패 [{code}]: {type(e).__name__} {str(e)[:120]}")
             return None
         if r.status_code != 200 or str(j.get("rt_cd", "1")) != "0":
             if str(j.get("msg_cd") or "") in TOKEN_DEAD and not _retry:
                 self._clear_token()
                 return self.order(code, qty, side, ord_dvsn, price, _retry=True)
-            self._fail(f"주문({side})", r, j)
+            self.last_err = self._fail(f"주문({side})", r, j)
             return None
         o = j.get("output") or {}
         return {"ord_no": o.get("ODNO") or "", "org": o.get("KRX_FWDG_ORD_ORGNO") or "",
@@ -239,6 +246,12 @@ class PaperKIS:
                              headers=self._headers(TR_BAL))
             j = r.json()
         except Exception as e:
+            # 개장 직후 KIS 가 자주 끊는다. 한 번은 다시 물어본다 — 여기서
+            # 포기하면 그 회차의 청산 점검이 통째로 비고, 손절선을 넘긴
+            # 포지션이 방치된다.
+            if _retry < 1:
+                time.sleep(0.5)
+                return self._bal_raw(ofl, prod, quiet, _retry + 1)
             self.log(f"모의 잔고조회 통신 실패: {type(e).__name__} {str(e)[:120]}")
             return None, "NET"
         if r.status_code != 200 or str(j.get("rt_cd", "1")) != "0":
@@ -483,14 +496,29 @@ def make_approver(pk: "PaperKIS", bk: dict, price_fn, cfg: dict, log=print):
         px = float(q.get("last") or 0.0) or float(pend.get("px") or 0.0)
         if px <= 0:
             return f"*{pend['name']}* 현재가를 못 받아 주문하지 않았습니다."
+
+        # 상한가는 매도 호가가 없어 실전에서는 시장가로도 못 산다. 모의투자는
+        # 체결될 수 있는데 그게 더 나쁘다 — 실전에서 불가능한 체결이 데이터로
+        # 쌓이면 나중에 수익률을 믿을 수 없게 된다. 하한가도 같은 이유로 막는다.
+        now_pct = float(q.get("chg_pct") if q.get("chg_pct") is not None
+                        else pend.get("pct") or 0.0)
+        lim = cfg.get("PRICE_LIMIT_PCT", 29.5)
+        if lim and abs(now_pct) >= lim:
+            side = "상한가" if now_pct > 0 else "하한가"
+            return (f"⛔ *{pend['name']}* {now_pct:+.1f}% — {side}라 주문하지 않았습니다.\n"
+                    f"반대 호가가 없어 실전에서는 체결이 안 됩니다. "
+                    f"모의에서만 체결되면 데이터가 오염됩니다.")
         qty = int(cfg["PAPER_ORDER_KRW"] // px)
         if qty < 1:
             return (f"*{pend['name']}* 주당 {px:,.0f}원이라 주문금액"
                     f"({cfg['PAPER_ORDER_KRW']:,}원)으로 1주도 못 삽니다.")
 
+        pk.last_err = ""
         o = pk.order(code, qty, "buy")
         if not o:
-            return f"❌ *{pend['name']}* 모의 주문 실패 — 로그를 확인하세요."
+            why = pk.last_err or "사유 불명 — Actions 로그를 확인하세요"
+            return (f"❌ *{pend['name']}* {qty:,}주 @ {px:,.0f}원 주문 실패\n"
+                    f"{why}")
 
         sd = float(pend.get("sd") or 0.0)
         stop = px * (1 - cfg["STOP_SD"] * sd) if sd > 0 else 0.0
@@ -526,13 +554,24 @@ def check_exits(pk: "PaperKIS", bk: dict, price_fn, cfg: dict, log=print) -> lis
 
     # 잔고와 대조. 조회 실패(None)와 빈 잔고({})는 반드시 구분해야 한다.
     bal = pk.balance()
+    now_ts = time.time()
+    grace = float(cfg.get("SETTLE_GRACE_SEC", 600))
     if bal is not None:
         for code in list(pos):
-            if code not in bal:
-                p = pos.pop(code)
-                log(f"장부에만 있던 포지션 정리: {p.get('name', code)} (잔고에 없음)")
-                bk.setdefault("closed", []).append(
-                    {**p, "exit_reason": "잔고불일치", "exit_ts": int(time.time())})
+            if code in bal:
+                continue
+            # 시장가 주문도 접수와 체결 사이에 시차가 있다. 그 사이 잔고에는
+            # 안 잡히는데, 그걸 '없는 포지션' 으로 읽고 지우면 방금 산 종목을
+            # 장부에서 잃어버린다. 손절도 익절도 영영 안 걸린다.
+            age = now_ts - float(pos[code].get("entry_ts") or 0)
+            if age < grace:
+                log(f"{pos[code].get('name', code)} 아직 잔고 미반영 "
+                    f"({age:.0f}초 경과) — 체결 대기로 보고 유지")
+                continue
+            p = pos.pop(code)
+            log(f"장부에만 있던 포지션 정리: {p.get('name', code)} (잔고에 없음)")
+            bk.setdefault("closed", []).append(
+                {**p, "exit_reason": "잔고불일치", "exit_ts": int(time.time())})
         for code, p in pos.items():
             if bal.get(code, {}).get("qty"):
                 p["qty"] = bal[code]["qty"]
@@ -551,15 +590,24 @@ def check_exits(pk: "PaperKIS", bk: dict, price_fn, cfg: dict, log=print) -> lis
         # 성과를 부풀리지 않는다.
         if px > 0 and p.get("stop") and px <= p["stop"]:
             reason = "손절"
-        elif px > 0 and p.get("target") and px >= p["target"]:
+        # 익절은 진입 다음 영업일부터 본다. 당일 익절을 허용하면 몇 분 만에
+        # 나가는 일이 생기는데, 그건 T+5 호라이즌 전략이 아니라 스캘핑이다.
+        # 더 큰 문제는 일봉 시뮬레이션이 당일 장중 경로를 볼 수 없다는 것이다 —
+        # 라이브만 당일 익절하면 두 결과를 비교할 수 없고, 비교가 이 시스템의
+        # 존재 이유다.
+        elif px > 0 and p.get("target") and px >= p["target"] and held >= 1:
             reason = "익절"
         elif held >= cfg["HOLD_DAYS"] and (hm >= 15 * 60 + 10 or held > cfg["HOLD_DAYS"]):
             reason = "시간청산"
         if not reason:
             continue
+        pk.last_err = ""
         o = pk.order(code, int(p["qty"]), "sell")
         if not o:
-            log(f"{p.get('name', code)} 청산 주문 실패 — 다음 회차에 다시 시도합니다")
+            log(f"{p.get('name', code)} {reason} 주문 실패 — 다음 회차에 다시 시도합니다"
+                + (f" ({pk.last_err})" if pk.last_err else ""))
+            msgs.append(f"⚠️ *{p.get('name', code)}* {reason} 주문이 실패했습니다 "
+                        f"— 다음 회차에 다시 시도합니다\n{pk.last_err}")
             continue
         ret = (px / ent - 1) * 100 if (ent and px) else float("nan")
         # 왕복 거래비용: 증권거래세 0.15% + 수수료·슬리피지 가정. 모의투자는

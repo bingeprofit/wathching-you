@@ -40,11 +40,11 @@ def sim_exit(entry: float, bars: list[dict], tp_pct: float,
              sl_pct: float, hold: int) -> dict | None:
     """일봉 경로로 익절·손절·시간청산을 재현한다. bars[0] 이 알림 당일(D0).
 
-    D0 은 **종가만** 본다. 진입이 장중이라 그날 고가·저가에는 진입 전 구간이
-    섞여 있고, 그걸 쓰면 사지도 않은 가격에 익절한 것으로 기록된다.
-    종가가 이미 목표를 넘겼다면 진입 후 어느 시점엔가 반드시 통과했으므로
-    그것만 인정한다. 장중에 찍고 되돌아온 경우는 놓치는데, 성과를 부풀리는
-    방향이 아니라 깎는 방향이라 그대로 둔다.
+    D0 은 **종가만** 보고, **익절은 D+1 부터** 본다. 진입이 장중이라 그날
+    고가·저가에는 진입 전 구간이 섞여 있고, 일봉으로는 당일 장중 경로를
+    복원할 수 없다. 라이브 청산도 같은 규칙을 쓴다 — 한쪽만 당일 익절하면
+    두 결과를 나란히 놓을 수 없고, 그 비교가 이 기록의 존재 이유다.
+    손절은 D0 종가부터 본다(리스크 관리는 미루지 않는다).
 
     같은 날 고가·저가가 익절선과 손절선을 모두 건드리면 순서를 알 수 없다.
     **손절이 먼저 닿았다고 본다** — 역시 부풀리지 않는 쪽이다."""
@@ -63,7 +63,8 @@ def sim_exit(entry: float, bars: list[dict], tp_pct: float,
         if not c:
             continue
         hit_sl = bool(sl and lo and lo <= sl)
-        hit_tp = bool(tp and hi and hi >= tp)
+        # 익절은 D+1 부터. 라이브도 같은 규칙이라 둘을 나란히 비교할 수 있다.
+        hit_tp = bool(tp and hi and hi >= tp and i >= 1)
         if hit_sl:
             return {"ret": round(-sl_pct, 3), "day": i,
                     "why": "손절+익절 동일봉" if hit_tp else "손절"}
