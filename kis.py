@@ -46,6 +46,26 @@ def _f(o: dict, k: str, d: float = 0.0) -> float:
         return d
 
 
+# 한글 종목명이 실려 오는 필드는 엔드포인트마다 다르다. 순위 API 는
+# hts_kor_isnm, 종목 마스터는 prdt_abrv_name 을 쓰고, 현재가 응답에는
+# 아예 없을 수도 있다 (bstp_kor_isnm 은 '업종'명이라 종목명이 아니다).
+# 어느 쪽이 오든 받도록 순서대로 훑고, 없으면 None 을 돌려준다.
+NAME_KEYS = ("hts_kor_isnm", "prdt_abrv_name", "prdt_name", "prdt_eng_name")
+
+
+def _kr_name(o: dict, code: str) -> str | None:
+    """응답에서 한글 종목명. 없으면 None.
+
+    **종목코드를 이름 대신 돌려주지 않는다.** 그렇게 하면 호출부에서
+    '이름을 못 받았다' 와 '이름이 마침 코드와 같다' 를 구분할 수 없어,
+    코드가 이름인 것처럼 캐시에 박혀 버린다."""
+    for k in NAME_KEYS:
+        v = str(o.get(k) or "").strip()
+        if v and v != code and v != code.lstrip("0"):
+            return v
+    return None
+
+
 class KIS:
     def __init__(self, app_key: str, app_secret: str, paper: bool = False,
                  state_dir: str = "state", min_gap: float = 0.12, log=print):
@@ -187,10 +207,20 @@ class KIS:
         o = j.get("output") or {}
         if not o:
             return None
-        return {"code": code, "market": "kr", "name": o.get("hts_kor_isnm", code),
+        return {"code": code, "market": "kr", "name": _kr_name(o, code),
                 "last": _f(o, "stck_prpr"), "chg_pct": _f(o, "prdy_ctrt"),
                 "volume": _f(o, "acml_vol"), "value": _f(o, "acml_tr_pbmn"),
                 "prev_close": _f(o, "stck_prpr") - _f(o, "prdy_vrss")}
+
+    def stock_name(self, code: str) -> str | None:
+        """종목 마스터에서 한글 종목명. 시세 응답에 이름이 없을 때의 최후 수단.
+
+        종목명은 거의 바뀌지 않으므로 호출부에서 캐시해 두고 재사용한다.
+        실패하면 None — 이름 하나 때문에 알림이 막히면 안 된다."""
+        j = self._get("/uapi/domestic-stock/v1/quotations/search-stock-info",
+                      "CTPF1002R", {"PRDT_TYPE_CD": "300", "PDNO": code})
+        o = j.get("output") or {}
+        return _kr_name(o, code) if o else None
 
     def movers(self, updown: str = "0", limit: int = 30) -> list[dict]:
         """국내 등락률 순위. updown '0'=상승률, '1'=하락률."""
@@ -210,9 +240,14 @@ class KIS:
             code = o.get("stck_shrn_iscd")
             if not code:
                 continue
+            # 거래대금(acml_tr_pbmn)까지 받는다. 등락률 순위 상위는 소형주가
+            # 지배하는데, 그 구분은 거래대금으로만 할 수 있다. 지금 임계로
+            # 거르지는 않고 로그에 남겨서 나중에 분석에서 갈라 보게 한다.
             out.append({"code": str(code).zfill(6), "market": "kr",
-                        "name": o.get("hts_kor_isnm", code), "last": _f(o, "stck_prpr"),
-                        "chg_pct": _f(o, "prdy_ctrt"), "volume": _f(o, "acml_vol")})
+                        "name": _kr_name(o, str(code).zfill(6)),
+                        "last": _f(o, "stck_prpr"),
+                        "chg_pct": _f(o, "prdy_ctrt"), "volume": _f(o, "acml_vol"),
+                        "value": _f(o, "acml_tr_pbmn")})
         return out
 
     def daily(self, code: str, days: int = 45) -> list[dict]:

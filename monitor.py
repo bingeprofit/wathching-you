@@ -146,6 +146,10 @@ cause 는 1~2문장, context 는 그 종목의 사업·테마 배경 1문장. �
 
 # ── 상태 (GitHub Actions 캐시로 실행 간 유지) ─────────────────────────────
 def load_state(market: str) -> dict:
+    # 종목명 캐시는 날짜와 무관하게 누적된다 (이름은 날마다 바뀌지 않는다).
+    # 알림 상태는 자정에 리셋되지만 여기에 얹혀 가면 같이 날아가므로 별도 파일.
+    if not _NAMES:
+        load_names()
     p = os.path.join(STATE_DIR, f"alerts_{market}.json")
     today = dt.datetime.now(KST).strftime("%Y-%m-%d")
     try:
@@ -164,6 +168,7 @@ def save_state(market: str, st: dict):
         json.dump(st, open(os.path.join(STATE_DIR, f"alerts_{market}.json"), "w"))
     except Exception as e:
         log(f"상태 저장 실패: {str(e)[:80]}")
+    save_names()
 
 
 def on_cooldown(st: dict, key: str) -> bool:
@@ -340,7 +345,12 @@ def build_rows(api, market: str, cand: dict) -> list[dict]:
                     m.get("symbol")) or {}
         sd, av = rf.get("sd"), rf.get("avg_vol") or 0.0
         pct = float(m.get("chg_pct") or 0.0)
-        row = {"ticker": code, "name": m.get("name") or code, "excd": m.get("excd"),
+        # 이름은 캐시를 거친다. 국내는 순위에서 빠지면 현재가 응답에 이름이
+        # 없어, 이걸 안 하면 알림에 종목코드만 찍힌다.
+        row = {"ticker": code,
+               "name": (name_of(code, m.get("name")) if market == "kr"
+                        else (m.get("name") or code)),
+               "excd": m.get("excd"),
                "last": last, "pct": pct, "sd_daily": sd, "session_min": smin,
                "value": float(m.get("value") or 0.0),
                "z": (pct / 100) / sd if sd else 0.0,
@@ -368,6 +378,78 @@ def fetch_many(fn, items: list) -> list:
 
 
 _TRACK: dict[str, dict[str, float]] = {"kr": {}, "us": {}, "fut": {}}
+
+# ── 종목명 캐시 ──────────────────────────────────────────────────────────
+# 이름은 엔드포인트마다 실려 오기도 하고 안 오기도 한다. 국내 등락률 순위에는
+# 붙어 오지만, 순위에서 빠진 뒤 현재가로만 재조회되는 종목은 이름이 없다.
+# 그래서 알림에 종목코드만 찍히는 일이 생긴다 — 한 번 알아낸 이름은 보관한다.
+_NAMES: dict[str, str] = {}
+_NAMES_DIRTY = [False]
+
+
+def _names_path() -> str:
+    return os.path.join(STATE_DIR, "kr_names.json")
+
+
+def load_names() -> None:
+    try:
+        d = json.load(open(_names_path()))
+        if isinstance(d, dict):
+            _NAMES.update({str(k): str(v) for k, v in d.items() if v})
+    except Exception:
+        pass
+
+
+def save_names() -> None:
+    if not _NAMES_DIRTY[0]:
+        return
+    try:
+        os.makedirs(STATE_DIR, exist_ok=True)
+        # 무한히 자라지 않게 상한을 둔다. 종목명은 건당 수십 바이트라
+        # 넉넉히 잡아도 캐시가 가볍다.
+        items = list(_NAMES.items())[-4000:]
+        json.dump(dict(items), open(_names_path(), "w"), ensure_ascii=False)
+        _NAMES_DIRTY[0] = False
+    except Exception as e:
+        log(f"종목명 캐시 저장 실패 (무시하고 진행): {type(e).__name__}")
+
+
+def remember_name(code: str, name: str | None) -> None:
+    """이름을 알아냈으면 보관. 코드와 같은 값은 이름이 아니므로 버린다."""
+    n = str(name or "").strip()
+    if not n or n == code or n == code.lstrip("0"):
+        return
+    if _NAMES.get(code) != n:
+        _NAMES[code] = n
+        _NAMES_DIRTY[0] = True
+
+
+def name_of(code: str, fresh: str | None = None) -> str:
+    """표시용 이름. 방금 받은 것 → 캐시 → (없으면) 코드."""
+    remember_name(code, fresh)
+    return _NAMES.get(code) or str(fresh or "").strip() or code
+
+
+def fill_names(api, cand: dict, budget: int = 6) -> None:
+    """이름이 비어 있는 종목을 종목 마스터로 채운다.
+
+    한 회차에 budget 개까지만 — 이름 때문에 시세 조회 한도를 쓰면 본말전도다.
+    한 번 채우면 캐시에 남으므로, 새 종목이 등장한 회차에만 실제로 호출된다."""
+    todo = [c for c, m in cand.items()
+            if not (m.get("name") or _NAMES.get(c))][:budget]
+    if not todo or not hasattr(api, "stock_name"):
+        return
+    got = 0
+    for c in todo:
+        try:
+            nm = api.stock_name(c)
+        except Exception as e:
+            log(f"종목명 조회 실패 [{c}]: {type(e).__name__} {str(e)[:60]}")
+            break                       # 한 번 막히면 이 회차는 더 시도하지 않는다
+        if nm:
+            remember_name(c, nm); got += 1
+    if got:
+        log(f"종목명 {got}건 보충 (캐시 {len(_NAMES)}건)")
 
 
 def _sticky(market: str, cand: dict, depth: int) -> list[str]:
@@ -538,6 +620,10 @@ def scan_kr(universe: str = "focus") -> list[dict]:
     for ud in ("0", "1"):                  # 0=상승률, 1=하락률
         for m in api.movers(ud, limit=CFG["RANK_N"] * mult):
             cand.setdefault(m["code"], m)
+    # 순위 응답에는 이름이 붙어 온다. 여기서 거둬 두면, 이 종목이 나중에
+    # 순위에서 빠져 현재가로만 조회될 때도 이름을 잃지 않는다.
+    for c, m in cand.items():
+        remember_name(c, m.get("name"))
     need = [c for c in watchlist("kr") + _sticky("kr", cand, CFG["TRACK_MAX"] * mult)
             if c not in cand]
     for p in fetch_many(api.price, need):
@@ -545,6 +631,7 @@ def scan_kr(universe: str = "focus") -> list[dict]:
     if not cand:
         log("KIS 등락률 순위 응답 없음 — 관심종목 설정이나 API 권한을 확인하세요")
         return []
+    fill_names(api, cand)               # 그래도 비어 있으면 종목 마스터로 보충
     return build_rows(api, "kr", cand)
 
 
