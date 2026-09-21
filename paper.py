@@ -383,6 +383,14 @@ def collect(tok: str, st: dict, on_approve, log=print) -> int:
     일 단위 호라이즌이면 문제없고, 장중 스캘핑은 애초에 불가능한 설계다."""
     if not tok:
         return 0
+    # update_id 는 봇마다 따로 센다. 봇을 갈아끼웠는데 캐시에 남은 옛 봇의 큰
+    # offset 을 그대로 쓰면 새 봇의 작은 update_id 가 전부 걸러져, 버튼이
+    # 조용히 먹통이 된다 — 에러도 안 난다. 토큰 지문이 바뀌면 위치를 되감는다.
+    fp = hashlib.sha256(tok.encode()).hexdigest()[:16]
+    if st.get("tg_fp") != fp:
+        if st.get("tg_fp"):
+            log("텔레그램 봇이 바뀌었습니다 — 버튼 수거 위치를 처음으로 되감습니다")
+        st["tg_fp"], st["offset"], st["handled"] = fp, 0, []
     try:
         r = requests.get(f"https://api.telegram.org/bot{tok}/getUpdates", timeout=20,
                          params={"offset": st.get("offset", 0), "timeout": 0,
@@ -424,7 +432,8 @@ def collect(tok: str, st: dict, on_approve, log=print) -> int:
 # 포지션의 단일 진실 원천은 KIS 잔고 API 다. 이 장부는 '왜 샀는지·언제 나갈지'
 # 처럼 잔고에 없는 것만 들고 있고, 수량·보유 여부는 매 회차 잔고와 대조한다.
 # 캐시가 날아가도 유령 포지션이 생기지 않게 하려는 것이다.
-BOOK0 = {"offset": 0, "handled": [], "pending": {}, "positions": {}, "closed": []}
+BOOK0 = {"offset": 0, "tg_fp": "", "handled": [], "pending": {},
+         "positions": {}, "closed": []}
 
 
 def book_path(state_dir: str) -> str:

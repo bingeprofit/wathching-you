@@ -396,14 +396,51 @@ CME 를 신청하셨다면 `ES,NQ,ZN` 처럼 넣으면 그대로 동작합니다
 | `KIS_APP_SECRET` | ✅ | 〃 |
 | `ANTHROPIC_API_KEY` | ✅ | [platform.claude.com/settings/keys](https://platform.claude.com/settings/keys) |
 | `ANTHROPIC_WORKSPACE_ID` | 조건부 | 조직 범위 키일 때만 (`wrkspc_...`) |
-| `TELEGRAM_TOKEN` | ✅ | 기존 봇 토큰 재사용 가능 |
-| `TELEGRAM_CHAT_ID` | ✅ | 〃 |
+| `TELEGRAM_TOKEN` | ✅ | **장중 전용 봇**을 따로 쓰세요 (바로 아래) |
+| `TELEGRAM_CHAT_ID` | ✅ | 개인 DM 이면 봇이 바뀌어도 같은 숫자 |
 | `KR_WATCHLIST` | 선택 | `005930,000660,035720` 형식 |
 | `US_WATCHLIST` | 선택 | `NVDA,TSM,SPY` 형식. 비우면 기본 목록 사용 |
 | `FUT_ROOTS` | 선택 | `ES,NQ,GC,CL` 형식. 비우면 기본 13품목 |
 
 **관심종목도 Variables 가 아니라 Secrets 에 넣으세요.** 공개 저장소에서는
 Variables 가 로그에 평문으로 남지만 Secrets 는 `***` 로 마스킹됩니다.
+
+### 장중 알림은 별도 봇으로 (일별 지표와 섞이지 않게)
+
+Quant Market Daily 는 하루 한 번 길게, 이 감시 루프는 장중에 수십 건씩 짧게
+보냅니다. 한 봇에 몰아넣으면 급등주 알림 사이에 일별 지표가 파묻힙니다.
+**봇을 하나 더 파서 대화방을 나누면 됩니다 — 코드는 손댈 필요가 없습니다.**
+
+| | 봇 | 키를 읽는 곳 |
+|---|---|---|
+| Quant Market Daily (KR/US) | 기존 봇 그대로 | Colab Secrets (`userdata`) |
+| 장중 감시 + 반자동 체결 + 신호 리뷰 | **새 봇** | GitHub Secrets |
+
+두 시스템이 애초에 다른 저장소에서 키를 읽으므로, GitHub Secrets 쪽
+`TELEGRAM_TOKEN` 만 새 토큰으로 바꾸면 분리가 끝납니다.
+
+1. 텔레그램에서 **@BotFather → `/newbot`** — 이름은 아무거나, 사용자명은
+   `..._intraday_bot` 처럼 끝이 `bot` 이어야 합니다. 토큰이 나옵니다.
+2. **새 봇과의 대화창에서 `/start` 를 반드시 누르세요.** 텔레그램은 먼저
+   말을 건 적 없는 사용자에게 봇이 메시지를 보내는 것을 막습니다. 이걸
+   빠뜨리면 워크플로는 정상인데 메시지만 안 옵니다 (`403 bot was blocked`).
+3. GitHub → Settings → Secrets → `TELEGRAM_TOKEN` **Update** 에 새 토큰.
+4. `TELEGRAM_CHAT_ID` 는 **그대로 둡니다.** 개인 DM 의 chat_id 는 상대 봇이
+   아니라 내 텔레그램 사용자 ID 라서 봇이 바뀌어도 같은 값입니다.
+   (확신이 안 서면 `https://api.telegram.org/bot<새토큰>/getUpdates` 를
+   브라우저로 열어 `"chat":{"id":...}` 를 확인하세요. `/start` 를 누른 뒤라야
+   나옵니다.)
+5. Actions → `intraday-kr` → Run workflow 로 한 번 돌려 새 방에 오는지 확인.
+
+`intraday-us`, `intraday-fut`, `signal-review` 는 같은 시크릿을 읽으므로
+자동으로 새 봇을 따라갑니다.
+
+> **승인 버튼도 같이 넘어갑니다.** `update_id` 는 봇마다 따로 세기 때문에,
+> 옛 봇의 offset 을 캐시에 물고 있으면 새 봇의 버튼이 조용히 먹통이 됩니다.
+> `paper.py` 가 토큰 지문을 장부에 같이 저장해 두었다가 봇이 바뀌면 수거
+> 위치를 자동으로 되감습니다 (로그에 `텔레그램 봇이 바뀌었습니다`).
+> 다만 **옛 봇에 이미 떠 있는 미승인 버튼은 죽습니다** — 눌러도 반응이
+> 없고 TTL(기본 15분)이 지나면 만료됩니다. 장 시작 전에 바꾸는 게 안전합니다.
 
 ### 공개 저장소에서 무엇이 가려지나
 
