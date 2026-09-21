@@ -89,6 +89,7 @@ jobs:
           APPROVE_TTL_MIN:  "15"  # 버튼 유효시간(분). 지나면 만료 안내만 회신
           HOLD_DAYS:        "5"   # 시간청산 — T+5 영업일
           STOP_SD:          "1.5" # 손절 — 진입가 -1.5×일간σ
+          TAKE_PROFIT_PCT:  "5.0" # 익절 — 진입가 +5%. 0 이면 끔
           MAX_POSITIONS:    "5"
           ROUND_TRIP_PCT:   "0.55"
           QUIET_LOG:     "1"      # 로그에 종목명을 남기지 않는다 (공개 저장소)
@@ -118,3 +119,4 @@ jobs:
               --interval "${{ github.event.inputs.interval || '60' }}" \
               --max-minutes 230
           fi
+
