@@ -57,10 +57,15 @@ def _f(d: dict, k: str) -> float:
 
 
 def weekdays_between(ymd: str, today: dt.date | None = None) -> int:
-    """진입일로부터 지난 영업일 수. 공휴일 달력은 없으므로 주말만 뺀다.
+    """진입일로부터 지난 '주중' 일수. 공휴일을 모르므로 **실제 거래일이 아니다.**
 
-    공휴일 때문에 하루 이틀 늦게 나가는 것은 허용한다. 반대로 달력을 들고
-    있다가 틀리는 것보다, 늦게라도 반드시 나가는 쪽이 안전하다."""
+    휴장일을 경과일로 세기 때문에 연휴가 끼면 보유기간을 실제보다 길게 본다.
+    2026년 추석(9/24~25 휴장)에는 9/21 진입 포지션이 9/28 에 '5영업일'로 잡히는데
+    실제로 장이 선 날은 3일뿐이다. 그러면 시간청산이 이틀 일찍 나가고,
+    일봉으로 재현하는 backfill 과 숫자가 어긋나 비교 자체가 깨진다.
+
+    그래서 이 함수는 **일봉을 못 받았을 때의 대비책**으로만 쓴다.
+    정상 경로는 held_days() — 실제 일봉 개수를 센다."""
     try:
         d0 = dt.datetime.strptime(ymd, "%Y%m%d").date()
     except (TypeError, ValueError):
@@ -72,6 +77,40 @@ def weekdays_between(ymd: str, today: dt.date | None = None) -> int:
         if cur.weekday() < 5:
             n += 1
     return n
+
+
+def held_days(code: str, entry_date: str, bars_fn=None, cache: dict | None = None,
+              log=print) -> tuple[int, bool]:
+    """진입일 이후 **실제로 장이 선 날** 수와, 일봉으로 셌는지 여부. (n, exact)
+
+    달력을 들고 있지 않아도 되는 이유가 이것이다. 일봉은 장이 선 날에만
+    생기므로, 진입일보다 뒤인 봉을 세면 그게 곧 거래일 수다. 설·추석·임시공휴일
+    어느 것도 따로 알 필요가 없고, 내년에도 그대로 맞는다.
+
+    일봉을 못 받으면 weekdays_between 으로 내려간다 — 그 경우 exact=False 라
+    호출부가 '정확하지 않다' 는 것을 알고 처리할 수 있다."""
+    today = dt.datetime.now(KST).strftime("%Y%m%d")
+    if cache is not None:
+        if cache.get("date") != today:       # 날짜가 바뀌면 통째로 버린다
+            cache.clear(); cache["date"] = today
+        hit = (cache.get("map") or {}).get(code)
+        if hit is not None:
+            return int(hit), True
+    if bars_fn and entry_date:
+        try:
+            bars = bars_fn(code) or []
+        except Exception as e:
+            log(f"보유일 계산용 일봉 실패 [{code}]: {type(e).__name__} {str(e)[:60]}")
+            bars = []
+        dates = {str(b.get("date") or "") for b in bars}
+        dates.discard("")
+        # 진입일 자체는 세지 않는다. 그 날 종가에 샀으므로 보유 0일이다.
+        if dates and max(dates) >= entry_date:
+            n = sum(1 for d in dates if d > entry_date)
+            if cache is not None:
+                cache.setdefault("map", {})[code] = n
+            return n, True
+    return weekdays_between(entry_date), False
 
 
 class PaperKIS:
@@ -522,7 +561,7 @@ def collect(tok: str, st: dict, on_approve, log=print) -> int:
 # 처럼 잔고에 없는 것만 들고 있고, 수량·보유 여부는 매 회차 잔고와 대조한다.
 # 캐시가 날아가도 유령 포지션이 생기지 않게 하려는 것이다.
 BOOK0 = {"offset": 0, "tg_fp": "", "handled": [], "pending": {},
-         "positions": {}, "closed": []}
+         "positions": {}, "closed": [], "held_cache": {}}
 
 
 def book_path(state_dir: str) -> str:
@@ -640,7 +679,8 @@ def make_approver(pk: "PaperKIS", bk: dict, price_fn, cfg: dict, log=print):
     return on_approve
 
 
-def check_exits(pk: "PaperKIS", bk: dict, price_fn, cfg: dict, log=print) -> list[str]:
+def check_exits(pk: "PaperKIS", bk: dict, price_fn, cfg: dict, log=print,
+                bars_fn=None) -> list[str]:
     """보유 포지션을 점검해 청산 조건에 닿은 것을 시장가로 판다.
 
     청산이 자동인 이유는 단순하다. 진입에 재량이 들어가고 청산에도 재량이
@@ -680,7 +720,15 @@ def check_exits(pk: "PaperKIS", bk: dict, price_fn, cfg: dict, log=print) -> lis
         p = pos[code]
         q = price_fn(code) or {}
         px = float(q.get("last") or 0.0)
-        held = weekdays_between(p.get("entry_date", ""))
+        # 보유일은 **실제 일봉 개수**로 센다. 주중 일수로 세면 연휴가 낀 구간에서
+        # 휴장일까지 경과일로 쳐서 시간청산이 일찍 나가고, 일봉으로 재현하는
+        # backfill 과 숫자가 어긋난다 (2026 추석: 라이브 3거래일 vs 시뮬 5거래일).
+        held, exact = held_days(code, p.get("entry_date", ""), bars_fn,
+                                bk.setdefault("held_cache", {}), log)
+        if not exact and not bk.get("_warned_inexact"):
+            bk["_warned_inexact"] = True
+            log("일봉을 못 받아 보유일을 주중 일수로 셉니다 — 연휴가 끼면 "
+                "시간청산이 일찍 나갈 수 있습니다")
         ent = float(p.get("entry") or 0.0)
         reason = ""
         # 손절을 먼저 본다. 같은 스캔에서 양쪽 조건이 다 맞는 경우는 장중에

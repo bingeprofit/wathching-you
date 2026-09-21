@@ -1007,10 +1007,13 @@ def paper_pump(market: str) -> None:
         return
     api = kis_api()
     price_fn = (lambda c: api.price(c)) if api else (lambda c: None)
+    # 보유일을 실제 거래일로 세기 위한 일봉. 포지션당 하루 한 번만 불린다
+    # (paper 쪽에서 날짜별로 캐시하므로 매 회차 호출이 아니다).
+    bars_fn = (lambda c: api.daily(c, 40)) if api else None
     tok, cid = env("TELEGRAM_TOKEN"), env("TELEGRAM_CHAT_ID")
     try:
         P.collect(tok, bk, P.make_approver(pk, bk, price_fn, CFG, log), log)
-        for m in P.check_exits(pk, bk, price_fn, CFG, log):
+        for m in P.check_exits(pk, bk, price_fn, CFG, log, bars_fn=bars_fn):
             log(m.replace("*", ""))
             if tok and cid:
                 P.tg(tok, "sendMessage", chat_id=cid, text=m, parse_mode="Markdown")
