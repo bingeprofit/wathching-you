@@ -101,7 +101,24 @@ CFG = {
     # 주문 접수 후 잔고에 잡히기까지의 유예(초). 이 안에 잔고에 없어도
     # 체결 대기로 보고 장부를 지우지 않는다.
     "SETTLE_GRACE_SEC": float(env("SETTLE_GRACE_SEC", "600")),
-    "MAX_POSITIONS":    int(env("MAX_POSITIONS", "5")),
+    # 동시 보유 상한. 5 였을 때는 건당 1,000만원 × 5 = 5,000만원으로 시드 5억의
+    # 10% 밖에 못 썼고, 그보다 나쁘게 **표본이 안 쌓였다** — 이 계좌의 목적은
+    # 신호에 엣지가 있는지 볼 거래 기록을 모으는 것인데 대부분의 승인이 한도에
+    # 막혔다. 30 × 1,000만원 = 3억(시드의 60%)이고, 그 위는 현금 확인이 막는다.
+    "MAX_POSITIONS":    int(env("MAX_POSITIONS", "30")),
+    # 잔고에는 있는데 장부에 없는 종목을 장부로 들여 손절·시간청산을 건다.
+    # 0 이면 들이지 않고 하루 한 번 경고만 한다.
+    "ADOPT_ORPHANS":    env("ADOPT_ORPHANS", "1") == "1",
+    # 관리 대상에서 뺄 종목코드 (손으로 들고 있는 종목). 쉼표로 구분.
+    "PAPER_IGNORE":     env("PAPER_IGNORE", ""),
+    # σ 를 못 구했을 때의 손절 %. 예전엔 σ 가 없으면 손절이 아예 없었다.
+    "STOP_FALLBACK_PCT": float(env("STOP_FALLBACK_PCT", "7.0")),
+    # 장부가 비어 있을 때 잔고를 들여다보는 간격(초). 모의 서버 한도 보호용.
+    "ORPHAN_SCAN_SEC":  float(env("ORPHAN_SCAN_SEC", "300")),
+    # 매수 주문 구분. 01 시장가(기본). 13 은 IOC 시장가 — 즉시 체결되는
+    # 만큼만 사고 나머지는 취소한다. 모의투자가 13 을 받는지는 확인 전이라
+    # 기본값은 그대로 두었다 (거절되면 텔레그램에 사유가 온다).
+    "PAPER_ORD_DVSN":   env("PAPER_ORD_DVSN", "01"),
     # 왕복 거래비용(%) — 증권거래세 0.15% + 수수료 + 급변 종목 슬리피지 가정.
     # 모의투자는 슬리피지 없이 체결되므로 빼 줘야 실전에 가까운 수익률이 된다.
     "ROUND_TRIP_PCT":   float(env("ROUND_TRIP_PCT", "0.55")),
@@ -990,6 +1007,31 @@ def paper_ctx():
     return _PAPER["pk"], _PAPER["bk"]
 
 
+def paper_log(bk: dict):
+    """모의투자 쪽 로그용. QUIET_LOG 면 장부에 있는 종목명·코드를 가린다.
+
+    공개 저장소의 Actions 로그는 누구나 읽는다. paper.py 는 청산·편입 사유를
+    종목명과 함께 남기고, paper_pump 는 텔레그램 메시지를 로그에도 그대로
+    찍었다 — 그래서 QUIET_LOG 를 켜도 모의투자 쪽만은 이름이 새고 있었다.
+    장부(보유·대기·최근 청산)에 오른 이름과 코드를 로그 직전에 지운다."""
+    if not CFG["QUIET_LOG"]:
+        return log
+
+    def plog(*a):
+        s = " ".join(map(str, a))
+        hide = set()
+        for k, v in (bk.get("positions") or {}).items():
+            hide.update((k, str(v.get("name") or "")))
+        for k, v in (bk.get("pending") or {}).items():
+            hide.update((str(v.get("code") or k.split("|")[0]), str(v.get("name") or "")))
+        for c in (bk.get("closed") or [])[-50:]:
+            hide.update((str(c.get("_code") or ""), str(c.get("name") or "")))
+        for n in sorted((h for h in hide if len(h) >= 2), key=len, reverse=True):
+            s = s.replace(n, "●●")
+        log(s)
+    return plog
+
+
 def paper_pump(market: str) -> None:
     """승인 버튼 수거 + 자동 청산. 루프 매 회차에 부른다.
 
@@ -1011,10 +1053,11 @@ def paper_pump(market: str) -> None:
     # (paper 쪽에서 날짜별로 캐시하므로 매 회차 호출이 아니다).
     bars_fn = (lambda c: api.daily(c, 40)) if api else None
     tok, cid = env("TELEGRAM_TOKEN"), env("TELEGRAM_CHAT_ID")
+    plog = paper_log(bk)
     try:
-        P.collect(tok, bk, P.make_approver(pk, bk, price_fn, CFG, log), log)
-        for m in P.check_exits(pk, bk, price_fn, CFG, log, bars_fn=bars_fn):
-            log(m.replace("*", ""))
+        P.collect(tok, bk, P.make_approver(pk, bk, price_fn, CFG, plog, bars_fn=bars_fn), plog)
+        for m in P.check_exits(pk, bk, price_fn, CFG, plog, bars_fn=bars_fn):
+            plog(m.replace("*", ""))
             if tok and cid:
                 P.tg(tok, "sendMessage", chat_id=cid, text=m, parse_mode="Markdown")
     except Exception as e:

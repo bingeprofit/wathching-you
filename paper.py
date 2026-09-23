@@ -17,7 +17,7 @@
 명시돼 있어, 구 TR(VTTC0802U/0801U) 로 짜 두면 어느 날 조용히 주문이 안 나간다.
 """
 from __future__ import annotations
-import hashlib, json, os, re, time, datetime as dt
+import hashlib, json, os, re, statistics, time, datetime as dt
 from zoneinfo import ZoneInfo
 import requests
 
@@ -111,6 +111,42 @@ def held_days(code: str, entry_date: str, bars_fn=None, cache: dict | None = Non
                 cache.setdefault("map", {})[code] = n
             return n, True
     return weekdays_between(entry_date), False
+
+
+def sigma_from_bars(bars, today: str | None = None) -> float | None:
+    """일간 σ — monitor.ref_of 와 **같은 정의**다.
+
+    오늘 봉을 빼고 최근 21개 종가로 일간 수익률의 모표준편차를 낸다. 알림에
+    실리는 σ 와 정의가 같아야 '진입가 -1.5σ' 라는 손절선이 같은 뜻이 된다.
+    오늘 봉을 넣으면 지금 급등락한 폭이 σ 를 키워 손절선이 헐거워진다."""
+    today = today or dt.datetime.now(KST).strftime("%Y%m%d")
+    rows = sorted((b for b in (bars or []) if float(b.get("close") or 0) > 0),
+                  key=lambda b: str(b.get("date") or ""), reverse=True)
+    if rows and str(rows[0].get("date")) == today:
+        rows = rows[1:]
+    rows = rows[:21]
+    if len(rows) < 10:
+        return None
+    px = [float(r["close"]) for r in rows]
+    rets = [px[i] / px[i + 1] - 1 for i in range(len(px) - 1) if px[i + 1] > 0]
+    if len(rets) < 5:
+        return None
+    sd = statistics.pstdev(rets)
+    return sd if sd > 0 else None
+
+
+def stop_for(entry: float, sd: float, cfg: dict) -> tuple[float, str]:
+    """(손절가, 근거). σ 가 있으면 진입가 -STOP_SD×σ, 없으면 고정 %.
+
+    예전에는 σ 가 없으면 손절가를 0 으로 두었다. 0 은 '손절 없음' 이라,
+    그 포지션은 -20% 가 돼도 시간청산까지 그냥 들고 간다. 알림에 σ 가 비는
+    일은 드물지 않다(일봉 부족, 조회 실패). 그래서 고정 % 로 반드시 선을 긋는다."""
+    if not entry or entry <= 0:
+        return 0.0, ""
+    if sd and sd > 0:
+        return entry * (1 - float(cfg.get("STOP_SD", 1.5)) * sd), "σ"
+    fb = float(cfg.get("STOP_FALLBACK_PCT", 7.0) or 0.0)
+    return (entry * (1 - fb / 100), f"고정 {fb:g}%") if fb > 0 else (0.0, "")
 
 
 class PaperKIS:
@@ -445,8 +481,130 @@ class PaperKIS:
             if q > 0:
                 out[str(x.get("pdno") or "").zfill(6)] = {
                     "qty": int(q), "avg": _f(x, "pchs_avg_pric"),
-                    "last": _f(x, "prpr"), "pnl_pct": _f(x, "evlu_pfls_rt")}
+                    "last": _f(x, "prpr"), "pnl_pct": _f(x, "evlu_pfls_rt"),
+                    "name": str(x.get("prdt_name") or "").strip(),
+                    # 주문가능수량. 보유수량 > 0 인데 이게 0 이면 매도 주문이 이미
+                    # 걸려 있어 체결을 기다리는 중이다. 이걸 모르고 또 팔면 같은
+                    # 주식을 두 번 파는 주문이 나간다. 필드가 없으면 None(모름).
+                    "sellable": (int(_f(x, "ord_psbl_qty"))
+                                 if "ord_psbl_qty" in x else None)}
         return out
+
+    # ── 체결 조회 ───────────────────────────────────────────────────────
+    def _ccld(self, start: str, end: str, code: str = "", side: str = "",
+              odno: str = "", ccld: str = "00", _retry: int = 0) -> list | None:
+        """주식일별주문체결조회. 행 목록, **모르면 None** (빈 목록과 구분).
+
+        side: buy/sell/"" (전체). ccld: 00 전체, 01 체결, 02 미체결."""
+        params = {"CANO": self.cano, "ACNT_PRDT_CD": self.prod,
+                  "INQR_STRT_DT": start, "INQR_END_DT": end,
+                  "SLL_BUY_DVSN_CD": {"buy": "02", "sell": "01"}.get(side, "00"),
+                  "INQR_DVSN": "00", "PDNO": code, "CCLD_DVSN": ccld,
+                  "ORD_GNO_BRNO": "", "ODNO": odno, "INQR_DVSN_3": "00",
+                  "INQR_DVSN_1": "", "CTX_AREA_FK100": "", "CTX_AREA_NK100": ""}
+        try:
+            r = http("get",
+                     f"{PAPER_BASE}/uapi/domestic-stock/v1/trading/inquire-daily-ccld",
+                     timeout=15, params=params, headers=self._headers(TR_CCLD))
+            j = r.json()
+        except Exception as e:
+            if _retry < 1:
+                time.sleep(0.5)
+                return self._ccld(start, end, code, side, odno, ccld, _retry + 1)
+            self.log(f"체결조회 통신 실패 [{code or odno}]: {type(e).__name__} {str(e)[:80]}")
+            return None
+        if r.status_code != 200 or str(j.get("rt_cd", "1")) != "0":
+            mc = str(j.get("msg_cd") or "")
+            if mc == "EGW00201" and _retry < 2:          # 유량 초과 — 잠깐 쉬고 다시
+                time.sleep(1.0 * (_retry + 1))
+                return self._ccld(start, end, code, side, odno, ccld, _retry + 1)
+            if mc in TOKEN_DEAD and _retry < 1:
+                self._clear_token()
+                return self._ccld(start, end, code, side, odno, ccld, _retry + 1)
+            self._fail("체결조회", r, j)
+            return None
+        rows = j.get("output1")
+        return rows if isinstance(rows, list) else None
+
+    def fill_of(self, odno: str, code: str, side: str = "buy",
+                tries: int = 3, wait: float = 2.0) -> tuple[int, float, int] | None:
+        """방금 낸 주문의 (체결수량, 체결평균가, 주문수량). 모르면 None.
+
+        '주문 접수' 는 '체결' 이 아니다. 얇은 종목에 시장가로 3,300주를 넣으면
+        438주만 체결되고 나머지는 호가를 기다린다. 접수 응답만 보고 '3,300주
+        매수' 라고 알리면, 실제 노출과 알림이 여덟 배 차이가 난다."""
+        if not odno:
+            return None
+        today = dt.datetime.now(KST).strftime("%Y%m%d")
+        want = str(odno).lstrip("0")
+        last = None
+        for k in range(max(1, tries)):
+            if k:
+                time.sleep(wait)
+            rows = self._ccld(today, today, code=code, side=side, odno=odno)
+            if rows is None:
+                continue
+            for o in rows:
+                if str(o.get("odno") or "").lstrip("0") != want:
+                    continue
+                q, oq = int(_f(o, "tot_ccld_qty")), int(_f(o, "ord_qty"))
+                avg = _f(o, "avg_prvs")
+                if avg <= 0 and q > 0:
+                    avg = _f(o, "tot_ccld_amt") / q
+                last = (q, avg, oq)
+                break
+            if last and last[2] > 0 and last[0] >= last[2]:
+                break                               # 전량 체결 — 더 기다릴 필요 없다
+        return last
+
+    def last_buy_date(self, code: str, lookback: int = 60) -> str | None:
+        """이 종목의 가장 최근 **체결된** 매수일 (YYYYMMDD). 모르면 None.
+
+        장부 밖에서 발견된 보유종목의 보유일을 세려면 언제 샀는지가 필요하다.
+        그걸 모르고 발견한 날을 진입일로 치면, 이미 열흘 들고 있던 종목에
+        시간청산 시계가 처음부터 다시 돌아 닷새를 더 들고 간다."""
+        now = dt.datetime.now(KST)
+        start = (now - dt.timedelta(days=lookback)).strftime("%Y%m%d")
+        rows = self._ccld(start, now.strftime("%Y%m%d"), code=code, side="buy", ccld="01")
+        if rows is None:
+            return None
+        best = ""
+        for o in rows:
+            if str(o.get("pdno") or "").zfill(6) != str(code).zfill(6):
+                continue
+            if _f(o, "tot_ccld_qty") <= 0:
+                continue
+            d = str(o.get("ord_dt") or "")
+            if len(d) == 8 and d.isdigit() and d > best:
+                best = d
+        return best or None
+
+    def buy_power(self, code: str = "005930") -> float | None:
+        """지금 이 종목을 살 수 있는 현금(원). 모르면 None.
+
+        미수 없이 살 수 있는 금액(nrcvb_buy_amt)을 우선 쓴다. 주문가능현금
+        (ord_psbl_cash)은 증거금률에 따라 실제로 살 수 있는 것보다 커 보일 수 있다.
+        모를 때 None 을 돌려주는 것이 중요하다 — 0 으로 읽으면 조회가 한 번
+        실패했다는 이유로 모든 매수를 막아 버린다."""
+        p = {"CANO": self.cano, "ACNT_PRDT_CD": self.prod,
+             "PDNO": code, "ORD_UNPR": "0", "ORD_DVSN": "01",
+             "CMA_EVLU_AMT_ICLD_YN": "N", "OVRS_ICLD_YN": "N"}
+        try:
+            r = http("get", f"{PAPER_BASE}/uapi/domestic-stock/v1/trading/inquire-psbl-order",
+                     timeout=15, params=p, headers=self._headers("VTTC8908R"))
+            j = r.json()
+        except Exception:
+            return None
+        if r.status_code != 200 or str(j.get("rt_cd", "1")) != "0":
+            return None
+        o = j.get("output")
+        if not isinstance(o, dict):
+            return None
+        for k in ("nrcvb_buy_amt", "ord_psbl_cash"):
+            if str(o.get(k) or "").strip():
+                v = _f(o, k)
+                return v if v >= 0 else None
+        return None
 
     def cash(self) -> float | None:
         """주문가능현금. 잔고조회 output2 에서 꺼낸다."""
@@ -602,7 +760,8 @@ def offer(bk: dict, picks: list[dict], market: str) -> int:
     return ts
 
 
-def make_approver(pk: "PaperKIS", bk: dict, price_fn, cfg: dict, log=print):
+def make_approver(pk: "PaperKIS", bk: dict, price_fn, cfg: dict, log=print,
+                  bars_fn=None):
     """버튼이 눌렸을 때 실행할 함수를 만든다. 반환 문자열이 그대로 회신된다."""
 
     def on_approve(data: str, chat: str) -> str:
@@ -625,8 +784,9 @@ def make_approver(pk: "PaperKIS", bk: dict, price_fn, cfg: dict, log=print):
         bk["pending"].pop(key, None)
         if code in bk.get("positions", {}):
             return f"*{pend['name']}* 는 이미 보유 중입니다 — 추가 진입하지 않습니다."
-        if len(bk.get("positions", {})) >= cfg["MAX_POSITIONS"]:
-            return (f"동시 보유 한도({cfg['MAX_POSITIONS']}종목)에 걸렸습니다. "
+        cap = int(cfg.get("MAX_POSITIONS", 30) or 0)
+        if cap and len(bk.get("positions", {})) >= cap:
+            return (f"동시 보유 한도({cap}종목)에 걸렸습니다. "
                     "기존 포지션이 정리되면 다시 받겠습니다.")
 
         q = price_fn(code) or {}
@@ -650,33 +810,145 @@ def make_approver(pk: "PaperKIS", bk: dict, price_fn, cfg: dict, log=print):
             return (f"*{pend['name']}* 주당 {px:,.0f}원이라 주문금액"
                     f"({cfg['PAPER_ORDER_KRW']:,}원)으로 1주도 못 삽니다.")
 
+        # 현금을 먼저 본다. 모자라면 가능한 만큼만 산다. 조회가 실패하면(None)
+        # 막지 않고 그대로 낸다 — 정말 모자라면 서버가 사유와 함께 거절한다.
+        shrink = ""
+        cash = pk.buy_power(code)
+        if cash is not None:
+            if cash < px:
+                return (f"💸 *{pend['name']}* 주문가능현금 {cash:,.0f}원 — "
+                        f"1주({px:,.0f}원)도 못 삽니다.")
+            if qty * px > cash * 0.98:
+                qty = int(cash * 0.98 // px)
+                shrink = f"\n(현금이 모자라 {qty:,}주로 줄였습니다 — 가용 {cash:,.0f}원)"
+
         pk.last_err = ""
-        o = pk.order(code, qty, "buy")
+        o = pk.order(code, qty, "buy", ord_dvsn=str(cfg.get("PAPER_ORD_DVSN") or "01"))
         if not o:
             why = pk.last_err or "사유 불명 — Actions 로그를 확인하세요"
             return (f"❌ *{pend['name']}* {qty:,}주 @ {px:,.0f}원 주문 실패\n"
                     f"{why}")
 
+        # σ 가 비어 있으면 일봉으로 채운다. 예전에는 여기서 손절가가 0 이 되어
+        # 그 포지션은 영영 손절이 안 걸렸다.
         sd = float(pend.get("sd") or 0.0)
-        stop = px * (1 - cfg["STOP_SD"] * sd) if sd > 0 else 0.0
+        if sd <= 0 and bars_fn:
+            try:
+                sd = sigma_from_bars(bars_fn(code)) or 0.0
+            except Exception as e:
+                log(f"σ 보충용 일봉 실패 [{code}]: {type(e).__name__}")
+
+        # 접수 ≠ 체결. 실제로 몇 주가 얼마에 잡혔는지 확인한 뒤 알린다.
+        f = pk.fill_of(o.get("ord_no") or "", code)
+        filled, avg = (f[0], f[1]) if f else (0, 0.0)
+        entry = avg if (filled > 0 and avg > 0) else px
+        stop, stop_src = stop_for(entry, sd, cfg)
         tp = float(cfg.get("TAKE_PROFIT_PCT") or 0.0)
-        target = px * (1 + tp / 100) if tp > 0 else 0.0
+        target = entry * (1 + tp / 100) if tp > 0 else 0.0
         bk.setdefault("positions", {})[code] = {
-            "name": pend["name"], "qty": qty, "entry": px,
+            "name": pend["name"], "qty": filled if filled > 0 else qty,
+            "ord_qty": qty, "entry": entry, "quote": px,
             "entry_ts": int(time.time()),
             "entry_date": dt.datetime.now(KST).strftime("%Y%m%d"),
-            "sd": sd, "stop": stop, "target": target,
+            "sd": sd, "stop": stop, "stop_src": stop_src, "target": target,
             "trigger": pend.get("trigger") or "",
             "entry_pct": pend.get("pct"), "ord_no": o.get("ord_no", ""),
             "delay_min": round(age, 1)}
-        drop = f"{stop:,.0f}원" if stop else "미설정(σ 없음)"
+
+        nm = pend["name"]
+        if f is None or filled <= 0:
+            head = (f"✅ *{nm}* 매수 주문 접수 {qty:,}주 @ 약 {px:,.0f}원 "
+                    f"(약 {qty * px:,.0f}원) — 체결은 잔고로 확인해 관리합니다")
+        elif filled < qty:
+            head = (f"🟡 *{nm}* 매수 부분체결 {filled:,}/{qty:,}주 @ {avg:,.0f}원 "
+                    f"(약 {filled * avg:,.0f}원) — 나머지 {qty - filled:,}주는 미체결, "
+                    f"더 잡히면 잔고 기준으로 따라갑니다")
+        else:
+            head = (f"✅ *{nm}* 매수 체결 {filled:,}주 @ {avg:,.0f}원 "
+                    f"(약 {filled * avg:,.0f}원)")
+        drop = f"{stop:,.0f}원" + (f"({stop_src})" if stop_src and stop_src != "σ" else "") \
+            if stop else "미설정"
         goal = f"익절 {target:,.0f}원(+{tp:.1f}%) · " if target else ""
-        return (f"✅ *{pend['name']}* 매수 {qty:,}주 @ {px:,.0f}원 "
-                f"(약 {qty * px:,.0f}원)\n"
+        return (f"{head}\n"
                 f"{goal}손절 {drop} · 시간청산 T+{cfg['HOLD_DAYS']}영업일 · "
-                f"승인지연 {age:.1f}분")
+                f"승인지연 {age:.1f}분{shrink}")
 
     return on_approve
+
+
+def _ignored(cfg: dict) -> set:
+    """관리 대상에서 뺄 종목코드 (손으로 들고 있는 종목 등)."""
+    raw = cfg.get("PAPER_IGNORE") or ""
+    items = raw if isinstance(raw, (list, set, tuple)) else re.split(r"[,\s]+", str(raw))
+    return {str(c).strip().zfill(6) for c in items if str(c).strip()}
+
+
+def adopt_orphans(pk: "PaperKIS", bk: dict, bal: dict, cfg: dict, log=print,
+                  bars_fn=None) -> list[str]:
+    """잔고에는 있는데 장부에 없는 종목을 장부로 들인다. 알릴 메시지를 돌려준다.
+
+    **이게 없어서 손절이 안 걸렸다.** 예전 대조는 장부→잔고 한 방향이었다 —
+    장부에 있는데 잔고에 없으면 지웠지만, 잔고에 있는데 장부에 없으면 아무것도
+    하지 않았다. 그렇게 빠진 종목은 손절도 시간청산도 영영 안 걸린 채 방치된다.
+
+    장부에서 빠지는 길은 여럿이다. 통신이 끊겨 주문 성공 여부를 모른 채 넘어간
+    경우, 체결이 10분 넘게 늦어 '잔고불일치' 로 지워진 뒤 뒤늦게 체결된 경우,
+    오전·오후 잡이 겹쳐 오전 장부가 저장되기 전 캐시를 오후 잡이 복원한 경우.
+    길을 하나씩 막는 것보다, 잔고를 진실 원천으로 두고 매 회차 거꾸로도
+    맞추는 편이 확실하다 — 어떤 길로 빠졌든 다음 회차에 다시 잡힌다."""
+    msgs: list[str] = []
+    pos = bk.setdefault("positions", {})
+    ignore = _ignored(cfg)
+    now_ts = time.time()
+    grace = float(cfg.get("SETTLE_GRACE_SEC", 600))
+    # 방금 청산한 종목은 매도 체결 전까지 잔고에 남아 있다. 그걸 다시 들이면
+    # 같은 주식을 또 팔러 간다.
+    recent = {str(c.get("_code")).zfill(6)
+              for c in (bk.get("closed") or [])[-50:]
+              if c.get("_code") and now_ts - float(c.get("exit_ts") or 0) < grace}
+    adopt = cfg.get("ADOPT_ORPHANS", True)
+    today = dt.datetime.now(KST).strftime("%Y%m%d")
+    for code, b in bal.items():
+        if code in pos or code in ignore or code in recent:
+            continue
+        if b.get("sellable") == 0:
+            continue                    # 매도 주문이 이미 걸려 체결 대기 중
+        nm = b.get("name") or code
+        if not adopt:
+            warned = bk.setdefault("_orphan_warned", {})
+            if warned.get(code) != today:
+                warned[code] = today
+                msgs.append(f"⚠️ 장부에 없는 보유종목: *{nm}* {b['qty']:,}주 "
+                            f"({b.get('pnl_pct', 0):+.1f}%) — ADOPT_ORPHANS=0 이라 "
+                            f"손절·시간청산을 걸지 않습니다")
+            continue
+        entry = float(b.get("avg") or 0.0) or float(b.get("last") or 0.0)
+        if entry <= 0:
+            continue
+        sd = 0.0
+        if bars_fn:
+            try:
+                sd = sigma_from_bars(bars_fn(code)) or 0.0
+            except Exception as e:
+                log(f"편입 σ 계산용 일봉 실패 [{code}]: {type(e).__name__}")
+        stop, src = stop_for(entry, sd, cfg)
+        tp = float(cfg.get("TAKE_PROFIT_PCT") or 0.0)
+        bought = pk.last_buy_date(code)
+        time.sleep(0.3)                 # 모의 서버 유량 한도가 낮다
+        pos[code] = {
+            "name": nm, "qty": int(b["qty"]), "entry": entry,
+            "entry_ts": int(now_ts), "entry_date": bought or today,
+            "entry_date_src": "체결내역" if bought else "발견일(체결내역 조회 실패)",
+            "sd": sd, "stop": stop, "stop_src": src,
+            "target": entry * (1 + tp / 100) if tp > 0 else 0.0,
+            "trigger": "장부 밖 보유 → 편입", "adopted": True, "adopted_ts": int(now_ts)}
+        when = f"{bought[4:6]}/{bought[6:]} 매수" if bought else "매수일 불명 → 오늘부터 셈"
+        stop_s = f"{stop:,.0f}원" + (f"({src})" if src != "σ" else "") if stop else "미설정"
+        log(f"장부 밖 보유 편입: {nm} {b['qty']}주 @ {entry:,.0f}")
+        msgs.append(f"🔎 장부에 없던 보유종목 편입: *{nm}* {int(b['qty']):,}주 "
+                    f"@ {entry:,.0f}원 (현재 {b.get('pnl_pct', 0):+.1f}%)\n"
+                    f"손절 {stop_s} · {when} — 이번 회차부터 청산 규칙을 적용합니다")
+    return msgs
 
 
 def check_exits(pk: "PaperKIS", bk: dict, price_fn, cfg: dict, log=print,
@@ -686,13 +958,20 @@ def check_exits(pk: "PaperKIS", bk: dict, price_fn, cfg: dict, log=print,
     청산이 자동인 이유는 단순하다. 진입에 재량이 들어가고 청산에도 재량이
     들어가면, 결과가 좋든 나쁘든 무엇 때문인지 가릴 수가 없다."""
     msgs: list[str] = []
-    pos = bk.get("positions") or {}
+    pos = bk.setdefault("positions", {})
+    now_ts = time.time()
+
+    # 장부가 비어도 잔고는 본다. 예전엔 여기서 바로 돌아갔는데, 그러면 장부
+    # 밖으로 빠진 보유종목은 장부가 빌 때 영영 발견되지 않는다. 다만 모의
+    # 서버는 호출 한도가 낮으므로, 장부가 빈 동안에는 간격을 둔다.
     if not pos:
-        return msgs
+        gap = float(cfg.get("ORPHAN_SCAN_SEC", 300))
+        if now_ts - float(bk.get("_orphan_scan_ts") or 0) < gap:
+            return msgs
+    bk["_orphan_scan_ts"] = now_ts
 
     # 잔고와 대조. 조회 실패(None)와 빈 잔고({})는 반드시 구분해야 한다.
     bal = pk.balance()
-    now_ts = time.time()
     grace = float(cfg.get("SETTLE_GRACE_SEC", 600))
     if bal is not None:
         for code in list(pos):
@@ -700,7 +979,7 @@ def check_exits(pk: "PaperKIS", bk: dict, price_fn, cfg: dict, log=print,
                 continue
             # 시장가 주문도 접수와 체결 사이에 시차가 있다. 그 사이 잔고에는
             # 안 잡히는데, 그걸 '없는 포지션' 으로 읽고 지우면 방금 산 종목을
-            # 장부에서 잃어버린다. 손절도 익절도 영영 안 걸린다.
+            # 장부에서 잃어버린다. (그래도 빠졌다면 편입이 다시 잡아 온다.)
             age = now_ts - float(pos[code].get("entry_ts") or 0)
             if age < grace:
                 log(f"{pos[code].get('name', code)} 아직 잔고 미반영 "
@@ -709,10 +988,43 @@ def check_exits(pk: "PaperKIS", bk: dict, price_fn, cfg: dict, log=print,
             p = pos.pop(code)
             log(f"장부에만 있던 포지션 정리: {p.get('name', code)} (잔고에 없음)")
             bk.setdefault("closed", []).append(
-                {**p, "exit_reason": "잔고불일치", "exit_ts": int(time.time())})
+                {**p, "_code": code, "exit_reason": "잔고불일치", "exit_ts": int(now_ts)})
+
+        msgs += adopt_orphans(pk, bk, bal, cfg, log, bars_fn)
+
+        # 수량·평균단가는 잔고를 따른다. 부분체결이면 주문수량이 아니라 실제
+        # 체결수량이 포지션이고, 진입가도 호가가 아니라 체결평균가다. 손절·익절선은
+        # 실제 진입가 기준으로 다시 긋는다 — 호가 기준이면 체결이 높게 됐을 때
+        # 손절선이 실제보다 가깝게 잡혀 멀쩡한 포지션을 자른다.
         for code, p in pos.items():
-            if bal.get(code, {}).get("qty"):
-                p["qty"] = bal[code]["qty"]
+            b = bal.get(code)
+            if not b:
+                continue
+            if b.get("qty"):
+                p["qty"] = int(b["qty"])
+            avg = float(b.get("avg") or 0.0)
+            ent = float(p.get("entry") or 0.0)
+            if avg > 0 and (ent <= 0 or abs(avg / ent - 1) > 1e-4):
+                p["entry"] = avg
+                p["stop"], p["stop_src"] = stop_for(avg, float(p.get("sd") or 0.0), cfg)
+                tp = float(cfg.get("TAKE_PROFIT_PCT") or 0.0)
+                p["target"] = avg * (1 + tp / 100) if tp > 0 else 0.0
+
+    # 손절선이 비어 있는 포지션을 메운다 (예전 버전이 σ 없이 만든 것).
+    for code, p in pos.items():
+        if p.get("stop"):
+            continue
+        sd = float(p.get("sd") or 0.0)
+        if sd <= 0 and bars_fn:
+            try:
+                sd = sigma_from_bars(bars_fn(code)) or 0.0
+                p["sd"] = sd
+            except Exception:
+                sd = 0.0
+        p["stop"], p["stop_src"] = stop_for(float(p.get("entry") or 0.0), sd, cfg)
+        if p["stop"]:
+            log(f"{p.get('name', code)} 손절선이 비어 있어 새로 그었습니다: "
+                f"{p['stop']:,.0f}원 ({p['stop_src']})")
 
     now = dt.datetime.now(KST)
     hm = now.hour * 60 + now.minute
@@ -720,6 +1032,10 @@ def check_exits(pk: "PaperKIS", bk: dict, price_fn, cfg: dict, log=print,
         p = pos[code]
         q = price_fn(code) or {}
         px = float(q.get("last") or 0.0)
+        # 현재가 조회가 실패하면 예전엔 그 회차 손절 판정을 통째로 건너뛰었다.
+        # 잔고 응답에 현재가가 이미 실려 오므로 그것으로 대신한다.
+        if px <= 0 and bal and code in bal:
+            px = float(bal[code].get("last") or 0.0)
         # 보유일은 **실제 일봉 개수**로 센다. 주중 일수로 세면 연휴가 낀 구간에서
         # 휴장일까지 경과일로 쳐서 시간청산이 일찍 나가고, 일봉으로 재현하는
         # backfill 과 숫자가 어긋난다 (2026 추석: 라이브 3거래일 vs 시뮬 5거래일).
@@ -747,8 +1063,17 @@ def check_exits(pk: "PaperKIS", bk: dict, price_fn, cfg: dict, log=print,
             reason = "시간청산"
         if not reason:
             continue
+        # 팔 수 있는 수량만 판다. 주문가능수량이 0 이면 매도가 이미 걸려 체결을
+        # 기다리는 중이라, 여기서 또 내면 같은 주식에 매도가 두 번 걸린다.
+        sell_q = int(p["qty"])
+        sellable = (bal or {}).get(code, {}).get("sellable")
+        if sellable is not None:
+            if sellable <= 0:
+                log(f"{p.get('name', code)} {reason} 대상이지만 매도 체결 대기 중 — 건너뜀")
+                continue
+            sell_q = min(sell_q, int(sellable))
         pk.last_err = ""
-        o = pk.order(code, int(p["qty"]), "sell")
+        o = pk.order(code, sell_q, "sell")
         if not o:
             log(f"{p.get('name', code)} {reason} 주문 실패 — 다음 회차에 다시 시도합니다"
                 + (f" ({pk.last_err})" if pk.last_err else ""))
@@ -761,7 +1086,8 @@ def check_exits(pk: "PaperKIS", bk: dict, price_fn, cfg: dict, log=print,
         net = ret - cfg["ROUND_TRIP_PCT"]
         pos.pop(code, None)
         bk.setdefault("closed", []).append(
-            {**p, "exit": px, "exit_reason": reason, "exit_ts": int(time.time()),
+            {**p, "_code": code, "sold_qty": sell_q,
+             "exit": px, "exit_reason": reason, "exit_ts": int(time.time()),
              "exit_date": now.strftime("%Y%m%d"), "held_days": held,
              "ret_pct": round(ret, 2), "ret_net_pct": round(net, 2)})
         msgs.append(f"🔻 *{p.get('name', code)}* {reason} — {ent:,.0f} → {px:,.0f}원 "
