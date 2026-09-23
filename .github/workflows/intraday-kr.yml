@@ -31,8 +31,15 @@ on:
         type: boolean
         default: false
 
+# 오전·오후 스케줄을 **같은 그룹**에 둔다. 예전엔 크론 문자열로 그룹을 갈라
+# 두 잡이 동시에 돌 수 있었다. 오후 잡이 정시(12:00)에 깨면 오전 잡은 아직
+# 마지막 회차를 돌거나 캐시를 저장하는 중이고, 오후 잡은 그 **전** 캐시를
+# 복원한다 — 오전에 산 종목이 오후 장부에 없는 채로 시작하고, 오후 잡이
+# 나중에 저장하므로 그 상태가 다음 날까지 굳는다. 손절이 안 걸린 종목들이
+# 그렇게 생겼다. 같은 그룹이면 오후 잡은 오전 잡이 캐시까지 저장하고 끝날
+# 때까지 기다렸다가 시작한다 (대기는 1분 안팎, 과금되지 않는다).
 concurrency:
-  group: intraday-kr-${{ github.event.schedule || 'manual' }}
+  group: intraday-kr-${{ github.event_name == 'schedule' && 'sched' || 'manual' }}
   cancel-in-progress: false
 
 jobs:
@@ -91,8 +98,16 @@ jobs:
           STOP_SD:          "1.5" # 손절 — 진입가 -1.5×일간σ
           TAKE_PROFIT_PCT:  "5.0" # 익절 — 진입가 +5%. 0 이면 끔
           PRICE_LIMIT_PCT:  "29.5"# 상한가·하한가는 승인해도 주문하지 않음
-          MAX_POSITIONS:    "5"
+          # 동시 보유 상한. 30 × 1,000만원 = 3억(시드 5억의 60%). 그 위는
+          # 매수 직전 주문가능현금 확인이 막는다 (모자라면 가능한 만큼만 산다).
+          MAX_POSITIONS:    "30"
           ROUND_TRIP_PCT:   "0.55"
+          # 잔고에 있는데 장부에 없는 종목을 장부로 들여 손절·시간청산을 건다.
+          ADOPT_ORPHANS:    "1"
+          STOP_FALLBACK_PCT: "7.0" # σ 를 못 구했을 때의 손절 %
+          # 손으로 들고 있어 자동 청산하면 안 되는 종목코드 (쉼표 구분).
+          # 공개 저장소라 Secrets 로 둔다. 비워 두면 전부 관리 대상이다.
+          PAPER_IGNORE:     ${{ secrets.PAPER_IGNORE }}
           QUIET_LOG:     "1"      # 로그에 종목명을 남기지 않는다 (공개 저장소)
           Z_THRESHOLD:   "3.0"
           MIN_ABS_PCT:   "4.0"
