@@ -213,6 +213,10 @@ def summarize(rows: list[dict]) -> str:
     out.append("")
     cut("순간급변 경로", lambda r: "순간" in str(r.get("trigger") or ""))
     cut("누적 경로만", lambda r: str(r.get("trigger") or "") == "누적")
+    # 관심종목은 낮은 문턱으로 걸린 대형주다. 소형주 급등과 성과가 다를 것이라
+    # 따로 본다. 재알림(같은 날 두 번째)도 첫 알림과 다를 수 있어 분리한다.
+    cut("관심종목 경로", lambda r: str(r.get("trigger") or "") == "관심종목")
+    cut("같은 날 재알림", lambda r: (r.get("alert_n") or 1) > 1)
     out.append("")
     # 이 갈래가 가장 흥미롭다 — 원인이 특정되지 않은 급변은 수급 충격일
     # 가능성이 높고, 그렇다면 되돌림이 나와야 한다. 가설의 1차 검증이다.

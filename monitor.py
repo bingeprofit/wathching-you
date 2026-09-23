@@ -58,7 +58,36 @@ CFG = {
     "MAX_PER_HOUR":  int(env("MAX_PER_HOUR", "8")),       # 시간당 상한 (루프 폭주 방어)
     "MAX_PER_DAY":   int(env("MAX_PER_DAY", "40")),       # 하루 상한 (API 비용 방어)
     "COOLDOWN_MIN":  int(env("COOLDOWN_MIN", "120")),     # 같은 종목 재알림 금지 시간(분)
-    # ── 체결 가능성 필터 (한국만) ────────────────────────────────────────
+    # ── 같은 날 같은 종목 재알림 ─────────────────────────────────────────
+    # 쿨다운만으로는 +8% 로 오전에 알린 종목이 +8.5% 로 오후에 또 온다. 새 정보가
+    # 없는 알림이다. 그래서 쿨다운이 지나도 **움직임이 커졌을 때만** 다시 알린다:
+    #   같은 방향으로 max(REALERT_PP %p, 직전 알림 폭 × REALERT_REL) 이상 커졌거나
+    #   방향이 뒤집혔을 때(+8% → -5%). 그래도 종목당 하루 MAX_PER_TICKER_DAY 회까지.
+    "REALERT_PP":         float(env("REALERT_PP", "5.0")),
+    "REALERT_REL":        float(env("REALERT_REL", "0.5")),
+    "MAX_PER_TICKER_DAY": int(env("MAX_PER_TICKER_DAY", "2")),
+    # ── 관심종목(핵심) 경로 ──────────────────────────────────────────────
+    # AMD·META 같은 대형주는 σ 가 커서 '4% + 3σ + 거래량 1.8배' 를 좀처럼 못 넘는다.
+    # 등락률 순위는 소형주가 차지하므로 결국 알림에 대형주가 안 보인다.
+    # 관심종목은 문턱을 낮춰 따로 본다: |등락| ≥ CORE_MIN_ABS_PCT 이고 |z| ≥ CORE_Z,
+    # 거래량 조건 없음. 다만 시장 전체가 빠지는 날 수십 개가 한꺼번에 걸리지 않게
+    # 기준 ETF(미국 SPY) 대비 초과 등락이 CORE_MIN_REL_PCT 이상이어야 하고,
+    # 이 경로로만 걸린 종목은 한 번에 CORE_MAX_PER_SCAN 개까지.
+    "CORE_MIN_ABS_PCT":  float(env("CORE_MIN_ABS_PCT", "2.0")),
+    "CORE_Z":            float(env("CORE_Z", "2.0")),
+    "CORE_MIN_REL_PCT":  float(env("CORE_MIN_REL_PCT", "2.0")),
+    "CORE_MAX_PER_SCAN": int(env("CORE_MAX_PER_SCAN", "2")),
+    # ── 미국 위험 종목 필터 ─────────────────────────────────────────────
+    # 하루 +300~600% 짜리는 대개 $1 안팎 종목이 펌프된 것이다. 주가 하한은 **전일
+    # 종가** 기준 — 오늘 $1 → $6 으로 뛴 종목을 현재가로 보면 통과해 버린다.
+    "MIN_PRICE_USD":     float(env("MIN_PRICE_USD", "5")),
+    "MIN_TURNOVER_USD":  float(env("MIN_TURNOVER_USD", "1e7")),  # 일 환산 거래대금 하한($)
+    "MAX_SD_PCT_US":     float(env("MAX_SD_PCT_US", "12")),      # 일간 σ 상한(%). 0 이면 끔
+    # ── 급등 후 가라앉은 종목 (한국·미국 공통) ──────────────────────────
+    # 한 번 펌프됐다 1/N 로 가라앉은 종목은 같은 패턴을 되풀이한다. 전일 종가가
+    # 약 100거래일 최고 종가보다 DD_MAX_PCT % 이상 아래면 제외. 0 이면 끔.
+    "DD_MAX_PCT":        float(env("DD_MAX_PCT", "60")),
+    # ── 체결 가능성 필터 (한국) ──────────────────────────────────────────
     # 급등률 순위 상위는 가벼운 종목이 지배한다. 호가가 얇으면 +20% 가 몇 억으로
     # 만들어지고, 사러 들어가는 순간 그 폭이 사라진다. z 는 변동성으로 정규화할 뿐
     # **유동성**은 보지 않으므로, 여기서 따로 건다.
@@ -172,21 +201,36 @@ cause 는 1~2문장, context 는 그 종목의 사업·테마 배경 1문장. �
 
 
 # ── 상태 (GitHub Actions 캐시로 실행 간 유지) ─────────────────────────────
+def session_date(market: str) -> str:
+    """그 시장의 '오늘'. 알림 상태·체결 이력을 언제 리셋할지 정한다.
+
+    예전엔 전부 한국 날짜를 썼다. 미국장은 한국 자정을 걸쳐 돌기 때문에
+    (09:30 ET = 22:30 KST) 오후 단발 스캔(01:00 KST 이후)이 시작될 때마다
+    '날짜가 바뀌었다' 며 오전에 알린 기록을 지웠고, 같은 종목이 또 왔다.
+    해외선물은 18:00 ET 에 거래일이 넘어가므로 6시간 당겨 센다."""
+    if market == "kr":
+        return dt.datetime.now(KST).strftime("%Y-%m-%d")
+    now = dt.datetime.now(ET)
+    if market == "fut":
+        now += dt.timedelta(hours=6)
+    return now.strftime("%Y-%m-%d")
+
+
 def load_state(market: str) -> dict:
     # 종목명 캐시는 날짜와 무관하게 누적된다 (이름은 날마다 바뀌지 않는다).
     # 알림 상태는 자정에 리셋되지만 여기에 얹혀 가면 같이 날아가므로 별도 파일.
     if not _NAMES:
         load_names()
     p = os.path.join(STATE_DIR, f"alerts_{market}.json")
-    today = dt.datetime.now(KST).strftime("%Y-%m-%d")
+    today = session_date(market)
     try:
         d = json.load(open(p))
         if d.get("date") == today:
-            d.setdefault("sent", {}); d.setdefault("log", [])
+            d.setdefault("sent", {}); d.setdefault("log", []); d.setdefault("seen", {})
             return d
     except Exception:
         pass
-    return {"date": today, "sent": {}, "log": []}
+    return {"date": today, "sent": {}, "log": [], "seen": {}}
 
 
 def save_state(market: str, st: dict):
@@ -267,7 +311,7 @@ def save_hist(market: str, keep: int = 8):
     """체결 이력을 실행 간에 넘긴다. 30분 단발 스캔은 프로세스가 매번 새로 뜨므로
     이력을 저장해 두지 않으면 순간 변동 경로가 아예 작동하지 않는다."""
     os.makedirs(STATE_DIR, exist_ok=True)
-    d = {"date": dt.datetime.now(KST).strftime("%Y-%m-%d"),
+    d = {"date": session_date(market),
          "h": {k: list(v)[-keep:] for k, v in _HIST.items() if k.startswith(f"{market}:")}}
     try:
         json.dump(d, open(os.path.join(STATE_DIR, f"hist_{market}.json"), "w"))
@@ -281,7 +325,7 @@ def load_hist(market: str):
         d = json.load(open(p))
     except Exception:
         return
-    if d.get("date") != dt.datetime.now(KST).strftime("%Y-%m-%d"):
+    if d.get("date") != session_date(market):
         return                             # 어제 이력으로 오늘의 순간변동을 재면 안 된다
     for k, pts in (d.get("h") or {}).items():
         _HIST[k] = deque([tuple(x) for x in pts], maxlen=400)
@@ -332,12 +376,14 @@ _REF: dict[str, dict | None] = {}      # "kr:005930" / "us:NVDA" → {...}
 
 def ref_of(api, market: str, code: str, excd: str | None = None,
            symbol: str | None = None) -> dict | None:
-    """최근 20영업일 일간수익률 표준편차와 평균거래량. 하루에 한 번만 받으면 된다."""
+    """최근 20영업일 일간수익률 표준편차와 평균거래량, 그리고 약 100거래일 최고
+    종가(급등 후 가라앉은 종목 판별용). 하루에 한 번만 받으면 된다."""
     key = f"{market}:{code}"
     if key in _REF:
         return _REF[key]
     if market == "kr":
-        rows = api.daily(code)
+        # 150일(달력) ≈ 100거래일. KIS 일봉 한 번에 100개까지라 호출 수는 그대로다.
+        rows = api.daily(code, 150)
     elif market == "fut":
         rows = api.fut_daily(symbol or code, excd or "CME")
     else:
@@ -347,7 +393,8 @@ def ref_of(api, market: str, code: str, excd: str | None = None,
     today = dt.datetime.now(KST if market == "kr" else ET).strftime("%Y%m%d")
     if rows and str(rows[0].get("date")) == today:
         rows = rows[1:]                # 오늘 미완성 봉을 넣으면 지금 잡으려는 급등이
-    rows = rows[:21]                   # 제 자신의 σ 를 키워 z 를 눌러버린다 (순환 참조)
+    longer = rows[:120]                # 제 자신의 σ 를 키워 z 를 눌러버린다 (순환 참조)
+    rows = rows[:21]
     if len(rows) < 10:
         _REF[key] = None
         return None
@@ -355,7 +402,10 @@ def ref_of(api, market: str, code: str, excd: str | None = None,
     vs = [r.get("volume") or 0.0 for r in rows]
     rets = [px[i] / px[i + 1] - 1 for i in range(len(px) - 1)]   # 최신순이라 역순 비율
     sd = statistics.pstdev(rets)
-    _REF[key] = {"sd": sd if sd > 0 else None, "prev": px[0],
+    # 고점은 종가 기준(장중 꼬리는 펌프 당일 한 번 찍고 사라지는 값이라 과하다).
+    # 봉이 너무 적으면 '고점' 이 의미가 없으므로 비워 두고 필터는 통과시킨다.
+    hi = max(r["close"] for r in longer) if len(longer) >= 20 else None
+    _REF[key] = {"sd": sd if sd > 0 else None, "prev": px[0], "hi": hi,
                  "avg_vol": sum(vs) / len(vs) if vs else 0.0}
     return _REF[key]
 
@@ -377,7 +427,8 @@ def build_rows(api, market: str, cand: dict) -> list[dict]:
         row = {"ticker": code,
                "name": (name_of(code, m.get("name")) if market == "kr"
                         else (m.get("name") or code)),
-               "excd": m.get("excd"),
+               "excd": m.get("excd"), "market": market,
+               "prev_close": rf.get("prev"), "hi_long": rf.get("hi"),
                "last": last, "pct": pct, "sd_daily": sd, "session_min": smin,
                "value": float(m.get("value") or 0.0),
                "z": (pct / 100) / sd if sd else 0.0,
@@ -712,14 +763,38 @@ def scan_us(universe: str = "focus") -> list[dict]:
 
 
 # ── 선별 ─────────────────────────────────────────────────────────────────
+def prev_close_of(r: dict) -> float:
+    """전일 종가. 스냅샷의 현재가·등락률로 되짚는 것이 가장 확실하고(일봉 API 가
+    전일 봉을 늦게 올리는 날에도 맞다), 안 되면 일봉에서 받은 값."""
+    last, pct = float(r.get("last") or 0), r.get("pct")
+    if last > 0 and pct is not None and float(pct) > -99:
+        return last / (1 + float(pct) / 100)
+    return float(r.get("prev_close") or 0)
+
+
+def sunk(r: dict) -> str:
+    """급등 후 가라앉은 종목이면 이유를. 전일 종가가 ~100거래일 최고 종가보다
+    DD_MAX_PCT % 이상 아래 — '순간 급등 → 1/N 로 복귀' 를 되풀이하는 종목의 모양."""
+    lim, hi, pc = CFG["DD_MAX_PCT"], r.get("hi_long"), prev_close_of(r)
+    if not (lim and hi and pc > 0):
+        return ""
+    return f"100일 고점 대비 -{lim:g}% 이하" if pc <= hi * (1 - lim / 100) else ""
+
+
 def too_thin(r: dict) -> str:
-    """체결하기 어려운 종목이면 그 이유를, 아니면 빈 문자열.
+    """체결하기 어렵거나 위험이 지나친 종목이면 그 이유를, 아니면 빈 문자열.
 
     **데이터가 없으면 거르지 않는다.** 거래대금 필드가 안 실려 온 종목까지
     막아 버리면, 필드 하나 빠진 날 알림이 통째로 멈추고 그 사실조차 모른다.
     필터는 값이 있을 때만 작동하고, 없으면 통과시킨 뒤 로그로 드러낸다."""
-    if r.get("market") == "us" or r.get("excd"):     # 한국 종목에만 적용
+    mkt = r.get("market") or ("us" if r.get("excd") else "kr")
+    if mkt == "fut":                                 # 근월물 선물은 대상 아님
         return ""
+    why = sunk(r)
+    if why:
+        return why
+    if mkt == "us":
+        return _too_thin_us(r)
     px = float(r.get("last") or 0)
     lo = CFG["MIN_PRICE_KRW"]
     if lo and 0 < px < lo:
@@ -741,24 +816,68 @@ def too_thin(r: dict) -> str:
     return ""
 
 
-def pick(rows: list[dict], st: dict, limit: int) -> list[dict]:
-    """두 경로 중 하나라도 걸리면 알린다.
-      (A) 일중 누적: 절대 등락률 + 일간변동성 대비 z + 거래량 동반
-      (B) 순간 급변: 최근 N분 변동이 그 구간 기준으로 이례적 + 그 구간 거래량 동반"""
-    out = []
-    thin = {}
-    for r in rows:
-        if on_cooldown(st, r["ticker"]):
-            continue
-        why = too_thin(r)
-        if why:
-            thin[why] = thin.get(why, 0) + 1
-            continue
-        def ok(vr):
-            return (not (vr is not None and vr == vr)) or vr >= CFG["VOL_RATIO_MIN"]
+def _too_thin_us(r: dict) -> str:
+    lo, pc = CFG["MIN_PRICE_USD"], prev_close_of(r)
+    if lo and 0 < pc < lo:
+        return f"전일종가 ${lo:g} 미만"
+    val, need = float(r.get("value") or 0), CFG["MIN_TURNOVER_USD"]
+    if need and val > 0:
+        frac = max(elapsed_frac("us"), 0.08)
+        if val / frac < need:
+            return f"일환산 거래대금 ${need / 1e6:,.0f}M 미만"
+    cap, sd = CFG["MAX_SD_PCT_US"], r.get("sd_daily")
+    if cap and sd and sd * 100 > cap:
+        return f"일간 변동성 {cap:g}% 초과"
+    return ""
 
+
+def realert_block(prev: dict | None, pct: float) -> str:
+    """오늘 이미 알린 종목을 또 알릴지. 막아야 하면 이유를, 알려도 되면 빈 문자열."""
+    if not prev:
+        return ""
+    if int(prev.get("n") or 0) >= CFG["MAX_PER_TICKER_DAY"]:
+        return "종목당 하루 상한"
+    p0 = float(prev.get("pct") or 0.0)
+    if p0 * pct < 0 and abs(pct) >= CFG["MIN_ABS_PCT"]:
+        return ""                                   # 방향이 뒤집혔다 — 새 정보
+    need = max(CFG["REALERT_PP"], CFG["REALERT_REL"] * abs(p0))
+    if p0 * pct >= 0 and abs(pct) - abs(p0) >= need:
+        return ""                                   # 같은 방향으로 크게 더 갔다
+    return "움직임 확대 없음"
+
+
+_LOGGED: dict = {}
+
+
+def log_once(key: str, line: str) -> None:
+    """60초 루프에서 같은 줄을 매 회차 찍지 않는다 — 내용이 바뀔 때만."""
+    if _LOGGED.get(key) != line:
+        _LOGGED[key] = line
+        log(line)
+
+
+def pick(rows: list[dict], st: dict, limit: int, market: str | None = None) -> list[dict]:
+    """세 경로 중 하나라도 걸리면 알린다.
+      (A) 일중 누적: 절대 등락률 + 일간변동성 대비 z + 거래량 동반
+      (B) 순간 급변: 최근 N분 변동이 그 구간 기준으로 이례적 + 그 구간 거래량 동반
+      (C) 관심종목: 낮은 문턱, 거래량 무관, 시장 대비 초과 등락 (market 을 줄 때만)
+
+    걸린 뒤에는 '오늘 이미 알렸나' 와 체결성·위험 필터를 거친다. 관심종목은
+    사용자가 직접 고른 것이라 필터를 건너뛴다."""
+    out = []
+    thin, held = {}, {}
+    core = set(watchlist(market)) if market in ("us", "kr") else set()
+    bench = {"us": env("CORE_BENCH_US", "SPY"), "kr": env("CORE_BENCH_KR", "069500")}.get(market)
+    bpct = next((b.get("pct") for b in rows if b.get("ticker") == bench), None)
+    seen = st.setdefault("seen", {})
+
+    def ok(vr):
+        return (not (vr is not None and vr == vr)) or vr >= CFG["VOL_RATIO_MIN"]
+
+    for r in rows:
         z = r.get("z") or 0.0
-        hit_day = (abs(r.get("pct", 0)) >= CFG["MIN_ABS_PCT"]
+        pct = float(r.get("pct") or 0.0)
+        hit_day = (abs(pct) >= CFG["MIN_ABS_PCT"]
                    and abs(z) >= CFG["Z_THRESHOLD"] and ok(r.get("vol_ratio")))
 
         hit_burst = False
@@ -776,21 +895,63 @@ def pick(rows: list[dict], st: dict, limit: int) -> list[dict]:
                 hit_burst = abs(r["z_burst"]) >= CFG["BURST_Z"] and ok(
                     bvr if bvr is not None else r.get("vol_ratio"))
 
-        if hit_day or hit_burst:
-            r["trigger"] = ("순간급변" if hit_burst and not hit_day
-                            else ("급변+누적" if hit_burst else "누적"))
-            out.append(r)
-    # 지금 벌어지고 있는 것(순간급변)을 먼저, 각 그룹 안에서는 이례적인 순서로.
+        is_core = r["ticker"] in core
+        hit_core = False
+        if is_core and not (hit_day or hit_burst):
+            rel_ok = (bpct is None or r["ticker"] == bench
+                      or abs(pct - float(bpct)) >= CFG["CORE_MIN_REL_PCT"])
+            hit_core = (abs(pct) >= CFG["CORE_MIN_ABS_PCT"]
+                        and abs(z) >= CFG["CORE_Z"] and rel_ok)
+        if not (hit_day or hit_burst or hit_core):
+            continue
+
+        # ── 여기부터는 '걸린' 종목만. 막힌 이유를 세어 로그로 남긴다 ──
+        if on_cooldown(st, r["ticker"]):
+            held["쿨다운"] = held.get("쿨다운", 0) + 1
+            continue
+        prev = seen.get(r["ticker"])
+        why = realert_block(prev, pct)
+        if why:
+            held[why] = held.get(why, 0) + 1
+            continue
+        if not is_core:
+            why = too_thin(r)
+            if why:
+                thin[why] = thin.get(why, 0) + 1
+                continue
+        r["core"] = is_core
+        if prev:
+            r["prev_alert_pct"], r["alert_n"] = prev.get("pct"), int(prev.get("n") or 0) + 1
+        r["trigger"] = ("관심종목" if hit_core
+                        else "순간급변" if hit_burst and not hit_day
+                        else "급변+누적" if hit_burst else "누적")
+        out.append(r)
+    # 관심종목을 먼저 (순위에 밀려 안 보이던 것이 이 기능의 목적), 그다음 지금
+    # 벌어지고 있는 것(순간급변), 각 그룹 안에서는 이례적인 순서로.
     # 순간 z 와 일간 z 는 같은 척도가 아니므로 섞어서 크기 비교하지 않는다.
-    out.sort(key=lambda x: (0 if "급변" in x.get("trigger", "") else 1,
+    out.sort(key=lambda x: (0 if x.get("core") else 1,
+                            0 if "급변" in x.get("trigger", "") else 1,
                             -abs((x.get("z_burst") if "급변" in x.get("trigger", "")
                                   else x.get("z")) or 0)))
+    # 낮은 문턱으로만 걸린 관심종목은 한 번에 몇 개까지 — 시장이 크게 빠지는 날
+    # 대형주 수십 개가 예산을 다 먹지 않게.
+    n_core, kept = 0, []
+    for x in out:
+        if x.get("trigger") == "관심종목":
+            n_core += 1
+            if n_core > CFG["CORE_MAX_PER_SCAN"]:
+                continue
+        kept.append(x)
     # 필터가 실제로 무엇을 얼마나 잘랐는지 남긴다. 임계는 감이 아니라 이 숫자와
     # signals.jsonl 을 보고 조정해야 한다. 아무것도 안 잘리면 필터는 없는 셈이고,
     # 다 잘리면 알림이 사라진 이유가 여기 있다.
     if thin:
-        log("체결성 필터: " + ", ".join(f"{k} {v}건" for k, v in sorted(thin.items())))
-    return out[:limit]
+        log_once("thin", "체결성·위험 필터: "
+                 + ", ".join(f"{k} {v}건" for k, v in sorted(thin.items())))
+    if held:
+        log_once("held", "재알림 보류: "
+                 + ", ".join(f"{k} {v}건" for k, v in sorted(held.items())))
+    return kept[:limit]
 
 
 # ── 귀인 ─────────────────────────────────────────────────────────────────
@@ -949,7 +1110,10 @@ def log_signals(picks: list[dict], attrib: dict, market: str) -> None:
                     "vol_ratio": _num(r.get("vol_ratio")),
                     # 거래대금(원/달러). 소형주를 사후에 걸러내려면 이게 있어야 한다.
                     "value": _num(r.get("value")),
-                    "trigger": r.get("trigger"), "cause": a.get("cause"),
+                    "trigger": r.get("trigger"), "core": bool(r.get("core")),
+                    "alert_n": int(r.get("alert_n") or 1),
+                    "prev_close": _num(r.get("prev_close")), "hi_long": _num(r.get("hi_long")),
+                    "cause": a.get("cause"),
                     "confidence": a.get("confidence"),
                 }, ensure_ascii=False) + "\n")
     except Exception as e:
@@ -1100,6 +1264,8 @@ def render(picks: list[dict], attrib: dict, market: str) -> str:
         a = attrib.get(r["ticker"], {})
         nm = r.get("name") or r["ticker"]
         lab = r["ticker"] if nm == r["ticker"] else f"{nm} ({r['ticker']})"
+        if r.get("core"):
+            lab = "⭐ " + lab
         bits = [f"{r.get('z',0):+.1f}σ"]
         if r.get("burst") is not None:
             bits.append(f"{r.get('burst_min') or CFG['BURST_MIN']:.0f}분 {r['burst']*100:+.1f}%")
@@ -1109,6 +1275,9 @@ def render(picks: list[dict], attrib: dict, market: str) -> str:
         tg = f" `{r['trigger']}`" if r.get("trigger") else ""
         out.append(f"*{lab}*  {r['pct']:+.1f}%  ({' · '.join(bits)}){tg} "
                    f"{mark.get(str(a.get('confidence','')).lower(),'')}")
+        if r.get("prev_alert_pct") is not None:
+            out.append(f"  🔁 오늘 {r.get('alert_n') or 2}번째 — 직전 알림 "
+                       f"{float(r['prev_alert_pct']):+.1f}% → 지금 {r['pct']:+.1f}%")
         # get(k, 기본값) 은 값이 빈 문자열일 때 기본값을 안 준다 → 빈 줄이 찍힌다
         out.append(f"  {a.get('cause') or '원인 미조회'}")
         if a.get("context"):
@@ -1122,6 +1291,19 @@ def render(picks: list[dict], attrib: dict, market: str) -> str:
 
 # ── 실행 ─────────────────────────────────────────────────────────────────
 _BUDGET_SEEN: dict = {}
+
+
+def mark_sent(st: dict, picks: list[dict], now: float | None = None) -> None:
+    """보낸 알림을 상태에 남긴다. 쿨다운·일일예산과 함께, 재알림 판정에 쓸
+    '오늘 몇 번, 마지막에 몇 % 에서 알렸나' 를 기록한다."""
+    now = now or time.time()
+    seen = st.setdefault("seen", {})
+    for p in picks:
+        st["sent"][p["ticker"]] = now
+        st.setdefault("log", []).append(now)
+        s = seen.get(p["ticker"]) or {}
+        seen[p["ticker"]] = {"n": int(s.get("n") or 0) + 1,
+                             "pct": _num(p.get("pct")), "t": now}
 
 
 def scan_once(market: str, st: dict, universe: str,
@@ -1143,7 +1325,7 @@ def scan_once(market: str, st: dict, universe: str,
                 "수동 테스트는 --force 로 시간당 상한을 건너뜁니다")
         return 0, len(rows)
     _BUDGET_SEEN.pop("used", None)
-    picks = pick(rows, st, lim)
+    picks = pick(rows, st, lim, market)
     if not picks:
         return 0, len(rows)
     detail = "" if CFG["QUIET_LOG"] else ": " + ", ".join(
@@ -1166,10 +1348,7 @@ def scan_once(market: str, st: dict, universe: str,
                 f"{type(e).__name__} {str(e)[:100]}")
             markup = ""
     send(picks, attrib, market, markup)
-    now = time.time()
-    for p in picks:
-        st["sent"][p["ticker"]] = now
-        st.setdefault("log", []).append(now)
+    mark_sent(st, picks)
     save_state(market, st)
     return len(picks), len(rows)
 
