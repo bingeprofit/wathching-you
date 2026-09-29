@@ -65,6 +65,7 @@ jobs:
           STOP_SD:          "1.5"
           HOLD_DAYS:        "5"
           STATE_DIR:        "state"
+          MARKET_LABEL:     "한국"
         run: |
           python backfill.py --send \
             ${{ github.event.inputs.attach == 'true' && '--attach' || '' }}
@@ -81,7 +82,7 @@ jobs:
           STOP_SD:          "1.5"
           HOLD_DAYS:        "5"
           STATE_DIR:        "state_us"
+          MARKET_LABEL:     "미국"
         run: |
           python backfill.py --send \
             ${{ github.event.inputs.attach == 'true' && '--attach' || '' }}
-
