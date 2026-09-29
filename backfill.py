@@ -34,6 +34,12 @@ NO_EVENT = "확인된 촉발 사건 없음"
 TP_GRID = [float(x) for x in (os.environ.get("TP_GRID") or "0,3,5,8,12").split(",")]
 STOP_SD = float((os.environ.get("STOP_SD") or "1.5").strip())
 HOLD_DAYS = int((os.environ.get("HOLD_DAYS") or "5").strip())
+# 집계 메시지 머리에 붙일 시장 이름. 한국·미국 두 번 보내는데 머리가 같으면
+# 어느 쪽 숫자인지 알 수 없다. 비우면 행의 market 으로 정한다.
+LABEL = (os.environ.get("MARKET_LABEL") or "").strip()
+# fill() 이 왜 못 채웠는지. 0건이 '아직 5영업일이 안 지나서' 인지 '조회가
+# 실패해서' 인지 메시지만 보고 구분할 수 있어야 한다.
+DIAG: dict = {}
 
 
 def sim_exit(entry: float, bars: list[dict], tp_pct: float,
@@ -120,6 +126,8 @@ def fill(rows: list[dict]) -> int:
 
     todo = [r for r in rows if (r.get("r_t5") is None or not r.get("sim"))
             and r.get("px")]
+    DIAG.clear()
+    DIAG.update(todo=len(todo), no_bars=set(), no_d0=0, api_fail=set())
     if not todo:
         log("채울 행 없음"); return 0
 
@@ -139,6 +147,9 @@ def fill(rows: list[dict]) -> int:
             except Exception as e:
                 log(f"{k} 일봉 실패: {type(e).__name__} {str(e)[:80]}")
                 bars[k] = []
+                DIAG["api_fail"].add(k)
+            if not bars[k]:
+                DIAG["no_bars"].add(k)
         seq = sorted((b for b in bars[k] if b.get("close")),
                      key=lambda b: str(b.get("date") or ""))
         d0 = str(r.get("date") or "")
@@ -156,7 +167,10 @@ def fill(rows: list[dict]) -> int:
 
         # after[0] 이 알림 당일이다. 아직 그날 봉이 확정 안 됐으면 건너뛴다.
         if str(after[0].get("date")) != d0:
+            DIAG["no_d0"] += 1
             continue
+        # 알림 뒤로 거래일이 몇 개 지났는지 (휴장일은 봉이 없으니 자동으로 빠진다).
+        r["days_after"] = len(after) - 1
         r["r_close"], r["r_t1"], r["r_t5"] = ret(0), ret(1), ret(5)
         if r["r_t5"] is not None:
             r["r_t5_net"] = round(r["r_t5"] - COST, 3)
@@ -175,6 +189,9 @@ def fill(rows: list[dict]) -> int:
                 r["sim"] = sim
                 r["sl_pct"] = round(sl_pct, 3)
             filled += 1
+    if DIAG["no_bars"] or DIAG["no_d0"]:
+        log(f"못 채운 이유 — 일봉 없음 {len(DIAG['no_bars'])}종목, "
+            f"알림 당일 봉 없음 {DIAG['no_d0']}건")
     return filled
 
 
@@ -189,12 +206,52 @@ def _stat(vals: list[float]) -> str:
             f"중앙 {med:+.2f}%  승률 {win:.0f}%")
 
 
+def _label(rows: list[dict]) -> str:
+    if LABEL:
+        return LABEL
+    mk = {r.get("market") for r in rows}
+    return {"kr": "한국", "us": "미국"}.get(mk.pop(), "") if len(mk) == 1 else ""
+
+
+def pipeline(rows: list[dict]) -> list[str]:
+    """T+5 가 0건일 때 그게 정상인지 아닌지를 말해 주는 몇 줄.
+
+    '표본 0건' 만 보면 고장인지 기다리는 중인지 알 수 없다. 가장 앞선 알림이
+    지금 T+몇 까지 왔는지, 조회가 실패한 종목이 있는지를 함께 보여 준다."""
+    out = []
+    d = [r.get("date") for r in rows if r.get("date")]
+    if d:
+        first = min(d)
+        out.append(f"첫 알림 {first[:4]}-{first[4:6]}-{first[6:]} · "
+                   f"T+1 확정 {sum(r.get('r_t1') is not None for r in rows)}건 · "
+                   f"T+5 대기 {sum(r.get('r_t5') is None for r in rows)}건")
+    pend = [r for r in rows if r.get("r_t5") is None]
+    lead = max((r.get("days_after") or 0 for r in pend), default=None)
+    if pend and lead is not None:
+        left = max(HOLD_DAYS - lead, 1)
+        out.append(f"가장 앞선 대기 알림이 T+{lead} — {left}거래일 뒤 첫 확정"
+                   " (휴장일은 세지 않음)")
+    if DIAG.get("no_bars"):
+        out.append(f"⚠️ 일봉 조회 실패 {len(DIAG['no_bars'])}종목 — KIS 키·유량을 확인하세요")
+    if DIAG.get("no_d0"):
+        out.append(f"⚠️ 알림 당일 봉이 없는 행 {DIAG['no_d0']}건 — 날짜 기준이 어긋났을 수 있습니다")
+    return out
+
+
 def summarize(rows: list[dict]) -> str:
     done = [r for r in rows if r.get("r_t5") is not None]
-    out = [f"📊 *신호 집계* — 누적 알림 {len(rows)}건, 수익률 확정 {len(done)}건",
+    lab = _label(rows)
+    out = [f"📊 *신호 집계{' · ' + lab if lab else ''}* — 누적 알림 {len(rows)}건, "
+           f"수익률 확정 {len(done)}건",
            f"_T+5 영업일 종가 기준, 비용 {COST:.2f}% 차감 전 원수익률_", ""]
+    out += pipeline(rows)
+    out.append("")
     if len(done) < 20:
         out.append(f"아직 표본이 적습니다 ({len(done)}건). 판단은 100건 이후에 하세요.")
+        # T+5 가 쌓이기 전에도 방향은 볼 수 있게 T+1 만 따로 (참고용)
+        t1 = [r for r in rows if r.get("r_t1") is not None]
+        if t1:
+            out.append(f"_참고 — T+1 조기 집계: {_stat([r['r_t1'] for r in t1])}_")
         out.append("")
     if not done:
         return "\n".join(out)
