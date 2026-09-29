@@ -8,7 +8,12 @@ name: 신호 성과 집계
 # 미국장 루프(13:30~21:00 UTC)와도 겹치지 않는 유일한 구간이다.
 # 겹치면 두 잡이 같은 캐시를 서로 덮어써서 기록이 유실된다.
 #
-# 한국과 미국은 캐시가 따로라 signals.jsonl 도 둘이다. 각각 복원해 따로 돌린다.
+# 한국과 미국은 캐시가 따로라 signals.jsonl 도 둘이다. **잡을 둘로 나눠** 각각
+# 복원한다. 한 잡에서 미국 캐시를 state_us 폴더로 복원하려 했더니 한 번도
+# 복원되지 않았다 — actions/cache 는 저장할 때의 path 까지 캐시 버전에 넣기
+# 때문에, 장중 잡이 path: state 로 저장한 것은 path: state_us 로는 못 찾는다
+# ("Cache not found"). 그래서 미국 성과는 지금까지 한 건도 집계되지 않았다.
+# 두 잡 모두 장중 잡과 똑같이 path: state 를 쓴다.
 
 on:
   schedule:
@@ -25,9 +30,10 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  review:
+  review_kr:
+    name: 한국 신호 집계
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -36,23 +42,24 @@ jobs:
           cache: pip
       - run: pip install -r requirements.txt
 
-      # 한국 캐시 — 알림 기록 + 모의투자 장부가 여기 있다.
-      - name: 한국 상태 복원
+      # 장중 잡과 같은 path(state)·같은 접두어라야 복원된다. 채운 결과는 새 키로
+      # 저장되고, 다음 장중 잡이 그걸(가장 최신) 이어받는다.
+      - name: 상태 복원
         uses: actions/cache@v4
         with:
           path: state
           key: intraday-kr-${{ github.run_id }}
           restore-keys: intraday-kr-
 
-      # 미국 캐시 — 알림 기록만. 디렉터리를 나눠야 서로 덮어쓰지 않는다.
-      - name: 미국 상태 복원
-        uses: actions/cache@v4
-        with:
-          path: state_us
-          key: intraday-us-${{ github.run_id }}
-          restore-keys: intraday-us-
+      - name: 복원 확인
+        run: |
+          if [ -f state/signals.jsonl ]; then
+            echo "signals.jsonl $(wc -l < state/signals.jsonl)줄 복원"
+          else
+            echo "::warning::한국 알림 기록(state/signals.jsonl)이 없습니다 — 장중 잡이 아직 한 번도 저장하지 못했을 수 있습니다"
+          fi
 
-      - name: 한국 — 수익률 채우고 집계
+      - name: 수익률 채우고 집계
         env:
           TELEGRAM_TOKEN:   ${{ secrets.TELEGRAM_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
@@ -70,18 +77,52 @@ jobs:
           python backfill.py --send \
             ${{ github.event.inputs.attach == 'true' && '--attach' || '' }}
 
-      - name: 미국 — 수익률 채우고 집계
+  # 미국은 왕복 비용이 낮다 (증권거래세 없음, 수수료 + 슬리피지만).
+  # needs 로 한국 다음에 돈다 — KIS 토큰 발급(분당 1회)이 겹치지 않게.
+  review_us:
+    name: 미국 신호 집계
+    needs: review_kr
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+      - run: pip install -r requirements.txt
+
+      # 장중 잡과 같은 path(state)·같은 접두어라야 복원된다. 채운 결과는 새 키로
+      # 저장되고, 다음 장중 잡이 그걸(가장 최신) 이어받는다.
+      - name: 상태 복원
+        uses: actions/cache@v4
+        with:
+          path: state
+          key: intraday-us-${{ github.run_id }}
+          restore-keys: intraday-us-
+
+      - name: 복원 확인
+        run: |
+          if [ -f state/signals.jsonl ]; then
+            echo "signals.jsonl $(wc -l < state/signals.jsonl)줄 복원"
+          else
+            echo "::warning::미국 알림 기록(state/signals.jsonl)이 없습니다 — 장중 잡이 아직 한 번도 저장하지 못했을 수 있습니다"
+          fi
+
+      - name: 수익률 채우고 집계
         env:
           TELEGRAM_TOKEN:   ${{ secrets.TELEGRAM_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           KIS_APP_KEY:      ${{ secrets.KIS_APP_KEY }}
           KIS_APP_SECRET:   ${{ secrets.KIS_APP_SECRET }}
-          # 미국은 왕복 비용이 낮다 (증권거래세 없음, 수수료 + 슬리피지만).
           ROUND_TRIP_PCT:   "0.25"
+          # 익절 수준을 여러 개 동시에 시뮬레이션한다. 0 은 익절 없이
+          # T+5·손절만 쓰는 기준선. 손절선은 실제 운용과 같은 값을 쓴다.
           TP_GRID:          "0,3,5,8,12"
           STOP_SD:          "1.5"
           HOLD_DAYS:        "5"
-          STATE_DIR:        "state_us"
+          STATE_DIR:        "state"
           MARKET_LABEL:     "미국"
         run: |
           python backfill.py --send \
