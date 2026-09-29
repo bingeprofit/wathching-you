@@ -283,6 +283,78 @@ def market_open(market: str) -> bool:
     return (9 * 60 + 30) <= hm <= (16 * 60) if market == "us" else (9 * 60) <= hm <= (15 * 60 + 30)
 
 
+# 오늘 장이 실제로 섰는지 볼 대표 종목. 일봉 마지막 날짜가 오늘이면 개장.
+PROBE = {"kr": ("005930", None), "us": ("SPY", ("AMS", "NYS", "NAS"))}
+
+
+def traded_today(api, market: str) -> bool | None:
+    """오늘 장이 섰는가. True/False, 확인 못 하면 None.
+
+    market_open() 은 요일과 시각만 본다. 그래서 추석(9/24·25)에도 평일이라 돌았고,
+    KIS 는 휴장일에 **직전 거래일 스냅샷**을 그대로 돌려준다 — 9/23 의 등락률이
+    9/24 알림으로 다시 나가고, 그 날짜로 signals.jsonl 에 남았다. 달력을 들고
+    있으면 임시공휴일에서 언젠가 틀리므로, 대표 종목 일봉의 마지막 날짜가
+    오늘인지로 본다 (장중에는 KIS 일봉에 오늘 봉이 들어 있다)."""
+    code, exs = PROBE.get(market, (None, None))
+    if not code or api is None:
+        return None
+    today = dt.datetime.now(KST if market == "kr" else ET).strftime("%Y%m%d")
+    try:
+        if market == "kr":
+            rows = api.daily(code, 10)
+        else:
+            rows = []
+            for ex in exs:
+                rows = api.daily_os(ex, code)
+                if rows:
+                    break
+    except Exception as e:
+        log(f"개장 확인 실패({type(e).__name__}) → 열린 것으로 진행")
+        return None
+    dates = [str(r.get("date") or "") for r in rows if r.get("date")]
+    if not dates:
+        return None
+    return max(dates) == today
+
+
+def _probe_px(api, market: str) -> float | None:
+    code, exs = PROBE.get(market, (None, None))
+    try:
+        if market == "kr":
+            q = api.price(code)
+        else:
+            q = next((x for x in (api.price_os(ex, code) for ex in exs) if x), None)
+        return float(q.get("last") or 0) or None if q else None
+    except Exception:
+        return None
+
+
+def wait_until_traded(api, market: str, grace_min: int = 15) -> bool:
+    """휴장이라고 판정하려면 두 증거가 다 있어야 한다.
+      ① 대표 종목 일봉에 오늘 봉이 없고
+      ② grace_min 분 동안 그 종목 현재가가 한 번도 안 움직였다.
+    ① 만으로 자르면, 혹시 일봉이 장 마감 뒤에야 오늘 봉을 싣는 경우 **매일**
+    조용히 꺼진다. 휴장일 현재가는 전 거래일 종가에 멈춰 있으므로 ② 가 확실한
+    구분이다. 확인 자체가 안 되면 열린 것으로 본다 (조용히 하루를 비우는 것이
+    휴일에 한 번 더 도는 것보다 나쁘다)."""
+    deadline = time.time() + grace_min * 60
+    first = None
+    while True:
+        ok = traded_today(api, market)
+        if ok is None or ok:
+            return True
+        px = _probe_px(api, market)
+        if px is None:
+            return True
+        if first is None:
+            first = px
+        elif abs(px - first) > 1e-9:
+            return True                   # 가격이 움직인다 = 장이 섰다
+        if time.time() >= deadline:
+            return False
+        time.sleep(60)
+
+
 def elapsed_frac(market: str) -> float:
     """정규장 경과 비율. 거래량을 '같은 시각의 평소'와 견주기 위한 것.
 
@@ -1401,6 +1473,15 @@ def main():
             "(아직 앞 구간 잡이 담당)"); return
     if not a.force and not market_open(a.market):
         log(f"{a.market.upper()} 장 시간 아님 ({now:%H:%M}) → 종료"); return
+    # 평일이어도 공휴일이면 KIS 가 전 거래일 스냅샷을 준다 → 그걸로 알리면 안 된다.
+    # 개장 직후엔 오늘 봉·첫 체결이 늦을 수 있어 넉넉히(15분) 기다리지만, 장이 선 지
+    # 30분이 넘었으면 3분이면 충분하다 — 미국 오후 단발 잡은 제한시간이 15분이라
+    # 15분을 기다리면 휴장일마다 잡이 강제 종료된다.
+    since_open = elapsed_frac(a.market) * SESSION_OF.get(a.market, 390)
+    grace = 15 if since_open < 30 else 3
+    if not a.force and a.market in ("kr", "us") and not wait_until_traded(kis_api(), a.market, grace):
+        log(f"{a.market.upper()} 오늘({now:%m-%d})은 휴장으로 보입니다 — 대표 종목에 오늘 봉이 "
+            "없습니다. 전 거래일 스냅샷으로 알리지 않도록 종료합니다"); return
 
     st = load_state(a.market)
     load_hist(a.market)

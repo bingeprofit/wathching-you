@@ -125,7 +125,7 @@ def fill(rows: list[dict]) -> int:
     api = KIS(key, sec, state_dir=STATE_DIR, log=log)
 
     todo = [r for r in rows if (r.get("r_t5") is None or not r.get("sim"))
-            and r.get("px")]
+            and r.get("px") and not r.get("void")]
     DIAG.clear()
     DIAG.update(todo=len(todo), no_bars=set(), no_d0=0, api_fail=set())
     if not todo:
@@ -167,6 +167,10 @@ def fill(rows: list[dict]) -> int:
 
         # after[0] 이 알림 당일이다. 아직 그날 봉이 확정 안 됐으면 건너뛴다.
         if str(after[0].get("date")) != d0:
+            # 그날 봉은 없는데 그 뒤 봉은 있다 = 장이 안 선 날의 알림이다.
+            # (추석 9/24·25 처럼 평일 휴장에 모니터가 돌아 전 거래일 스냅샷으로 알린 것)
+            # 수익률이 정의되지 않으므로 표본에서 뺀다. 지우지는 않는다 — 기록은 남긴다.
+            r["void"] = "휴장일 알림"
             DIAG["no_d0"] += 1
             continue
         # 알림 뒤로 거래일이 몇 개 지났는지 (휴장일은 봉이 없으니 자동으로 빠진다).
@@ -191,7 +195,7 @@ def fill(rows: list[dict]) -> int:
             filled += 1
     if DIAG["no_bars"] or DIAG["no_d0"]:
         log(f"못 채운 이유 — 일봉 없음 {len(DIAG['no_bars'])}종목, "
-            f"알림 당일 봉 없음 {DIAG['no_d0']}건")
+            f"휴장일 알림(표본 제외) {DIAG['no_d0']}건")
     return filled
 
 
@@ -233,18 +237,22 @@ def pipeline(rows: list[dict]) -> list[str]:
                    " (휴장일은 세지 않음)")
     if DIAG.get("no_bars"):
         out.append(f"⚠️ 일봉 조회 실패 {len(DIAG['no_bars'])}종목 — KIS 키·유량을 확인하세요")
-    if DIAG.get("no_d0"):
-        out.append(f"⚠️ 알림 당일 봉이 없는 행 {DIAG['no_d0']}건 — 날짜 기준이 어긋났을 수 있습니다")
     return out
 
 
 def summarize(rows: list[dict]) -> str:
+    void = [r for r in rows if r.get("void")]
+    rows = [r for r in rows if not r.get("void")]
     done = [r for r in rows if r.get("r_t5") is not None]
     lab = _label(rows)
     out = [f"📊 *신호 집계{' · ' + lab if lab else ''}* — 누적 알림 {len(rows)}건, "
            f"수익률 확정 {len(done)}건",
            f"_T+5 영업일 종가 기준, 비용 {COST:.2f}% 차감 전 원수익률_", ""]
     out += pipeline(rows)
+    if void:
+        ds = sorted({str(r.get("date")) for r in void})
+        out.append(f"휴장일 알림 {len(void)}건은 표본에서 제외 "
+                   f"({', '.join(d[4:6] + '/' + d[6:] for d in ds)})")
     out.append("")
     if len(done) < 20:
         out.append(f"아직 표본이 적습니다 ({len(done)}건). 판단은 100건 이후에 하세요.")
