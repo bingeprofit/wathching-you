@@ -34,6 +34,35 @@ NO_EVENT = "확인된 촉발 사건 없음"
 TP_GRID = [float(x) for x in (os.environ.get("TP_GRID") or "0,3,5,8,12").split(",")]
 STOP_SD = float((os.environ.get("STOP_SD") or "1.5").strip())
 HOLD_DAYS = int((os.environ.get("HOLD_DAYS") or "5").strip())
+# 장기 추적 구간(거래일). 단타 성과(T+1·T+5)와 별개로, 알림이 '출발 신호' 였던
+# 종목이 몇 달 동안 이어졌는지를 본다 — 주도주를 가려내는 것이 이 기록의 목적이다.
+HORIZONS = [1, 5, 20, 60, 120]
+LEADER_PCT = float((os.environ.get("LEADER_PCT") or "50").strip())   # T+60 이 이만큼 넘으면 '이어진 종목'
+
+# 원인 문장 → 유형. 규칙 기반이라 비용이 없고 같은 문장은 항상 같은 유형이 된다.
+# 위에서부터 먼저 맞는 것을 쓴다 (예: '수주 기대감' 은 테마가 아니라 수주).
+CAUSE_TYPES = [
+    ("원인 미확인", ("확인된 촉발 사건 없음",)),
+    ("임상·허가", ("임상", "FDA", "허가", "승인", "품목허가", "기술이전", "라이선스")),
+    ("M&A·지분", ("인수", "합병", "M&A", "공개매수", "지분", "최대주주", "경영권", "매각")),
+    ("수주·계약", ("수주", "공급계약", "계약", "납품", "MOU", "협약", "파트너십", "수출")),
+    ("실적", ("실적", "영업이익", "매출", "순이익", "어닝", "가이던스", "잠정")),
+    ("증자·분할", ("무상증자", "유상증자", "액면분할", "자사주", "배당", "소각")),
+    ("정책·규제", ("정책", "정부", "규제", "법안", "관세", "보조금", "지원", "대통령", "국회")),
+    ("시황·테마", ("테마", "관련주", "기대감", "순환매", "급등", "섹터", "업종", "동반")),
+]
+
+
+def cause_type(cause) -> str:
+    c = str(cause or "").strip()
+    if not c:
+        return "원인 미조회"
+    for name, keys in CAUSE_TYPES:
+        if any(k in c for k in keys):
+            return name
+    return "기타"
+
+
 # 집계 메시지 머리에 붙일 시장 이름. 한국·미국 두 번 보내는데 머리가 같으면
 # 어느 쪽 숫자인지 알 수 없다. 비우면 행의 market 으로 정한다.
 LABEL = (os.environ.get("MARKET_LABEL") or "").strip()
@@ -124,8 +153,11 @@ def fill(rows: list[dict]) -> int:
         log("KIS 키 미설정 → 수익률 채우기 생략"); return 0
     api = KIS(key, sec, state_dir=STATE_DIR, log=log)
 
-    todo = [r for r in rows if (r.get("r_t5") is None or not r.get("sim"))
-            and r.get("px") and not r.get("void")]
+    for r in rows:
+        if "ctype" not in r and r.get("cause") is not None:
+            r["ctype"] = cause_type(r.get("cause"))
+    todo = [r for r in rows if r.get("px") and not r.get("void")
+            and (r.get(f"r_t{HORIZONS[-1]}") is None or not r.get("sim"))]
     DIAG.clear()
     DIAG.update(todo=len(todo), no_bars=set(), no_d0=0, api_fail=set())
     if not todo:
@@ -142,7 +174,8 @@ def fill(rows: list[dict]) -> int:
         k = f"{mk}:{tk}"
         if k not in bars:
             try:
-                bars[k] = (api.daily(tk) if mk == "kr"
+                # 국내는 150일(≈100봉) — 하루 이틀 건너뛰어도 기준점(anchor)이 창 안에 남게
+                bars[k] = (api.daily(tk, 150) if mk == "kr"
                            else api.daily_os(r.get("excd") or "NAS", tk)) or []
             except Exception as e:
                 log(f"{k} 일봉 실패: {type(e).__name__} {str(e)[:80]}")
@@ -150,35 +183,58 @@ def fill(rows: list[dict]) -> int:
                 DIAG["api_fail"].add(k)
             if not bars[k]:
                 DIAG["no_bars"].add(k)
-        seq = sorted((b for b in bars[k] if b.get("close")),
-                     key=lambda b: str(b.get("date") or ""))
+        seq = sorted(({**b, "date": str(b.get("date") or "")} for b in bars[k]
+                      if b.get("close") and b.get("date")),
+                     key=lambda b: b["date"])
         d0 = str(r.get("date") or "")
-        after = [b for b in seq if str(b.get("date") or "") >= d0]
-        if not after:
+        px = float(r.get("px") or 0)
+        if not seq or px <= 0:
             continue
-        px = float(r["px"])
-        if px <= 0:
+        # 알림일로부터 몇 번째 거래일인지 매긴다. 알림일이 일봉 창(약 100봉) 안에
+        # 있으면 그대로 세고, 창 밖으로 밀려났으면 지난 실행에 남긴 기준점
+        # (anchor_date = anchor_n 번째 거래일)에서 이어 센다. T+120 은 알림일이
+        # 창에서 빠진 뒤에야 오므로 이 이어 세기가 없으면 영영 못 채운다.
+        if seq[0]["date"] <= d0:
+            after = [b for b in seq if str(b.get("date") or "") >= d0]
+            if not after:
+                continue
+            if str(after[0].get("date")) != d0:
+                # 그날 봉은 없는데 그 뒤 봉은 있다 = 장이 안 선 날의 알림이다.
+                # (추석 9/24·25 처럼 평일 휴장에 모니터가 돌아 전 거래일 스냅샷으로 알린 것)
+                # 수익률이 정의되지 않으므로 표본에서 뺀다. 지우지는 않는다 — 기록은 남긴다.
+                r["void"] = "휴장일 알림"
+                DIAG["no_d0"] += 1
+                continue
+            idx = {str(b["date"]): i for i, b in enumerate(after)}
+        elif r.get("anchor_date") and r["anchor_date"] in {str(b["date"]) for b in seq}:
+            later = [b for b in seq if str(b["date"]) > r["anchor_date"]]
+            after = None
+            idx = {str(b["date"]): int(r["anchor_n"]) + 1 + i for i, b in enumerate(later)}
+            idx[r["anchor_date"]] = int(r["anchor_n"])
+        else:
+            DIAG["lost"] = DIAG.get("lost", 0) + 1     # 너무 오래 건너뛰어 기준점을 잃음
             continue
 
-        def ret(i: int):
-            if i >= len(after):
-                return None
-            return round((float(after[i]["close"]) / px - 1) * 100, 3)
+        closes = {i: float(b["close"]) for b in seq
+                  if (i := idx.get(str(b["date"]))) is not None}
+        last_i = max(closes)
+        r["days_after"] = last_i
+        r["anchor_date"] = next(d for d, i in idx.items() if i == last_i)
+        r["anchor_n"] = last_i
+        if 0 in closes:
+            r["r_close"] = round((closes[0] / px - 1) * 100, 3)
+        for h in HORIZONS:
+            if r.get(f"r_t{h}") is None and h in closes:
+                r[f"r_t{h}"] = round((closes[h] / px - 1) * 100, 3)
+        # 이어진 정도: T+1~T+120 사이 종가 기준 최고 수익률 (중간에 얼마나 갔나)
+        path = [c for i, c in closes.items() if 1 <= i <= HORIZONS[-1]]
+        if path:
+            pk = round((max(path) / px - 1) * 100, 3)
+            r["peak_ret"] = max(pk, r.get("peak_ret", pk))
 
-        # after[0] 이 알림 당일이다. 아직 그날 봉이 확정 안 됐으면 건너뛴다.
-        if str(after[0].get("date")) != d0:
-            # 그날 봉은 없는데 그 뒤 봉은 있다 = 장이 안 선 날의 알림이다.
-            # (추석 9/24·25 처럼 평일 휴장에 모니터가 돌아 전 거래일 스냅샷으로 알린 것)
-            # 수익률이 정의되지 않으므로 표본에서 뺀다. 지우지는 않는다 — 기록은 남긴다.
-            r["void"] = "휴장일 알림"
-            DIAG["no_d0"] += 1
-            continue
-        # 알림 뒤로 거래일이 몇 개 지났는지 (휴장일은 봉이 없으니 자동으로 빠진다).
-        r["days_after"] = len(after) - 1
-        r["r_close"], r["r_t1"], r["r_t5"] = ret(0), ret(1), ret(5)
-        if r["r_t5"] is not None:
+        if r.get("r_t5") is not None and not r.get("sim") and after is not None:
             r["r_t5_net"] = round(r["r_t5"] - COST, 3)
-            r["r_t1_net"] = round(r["r_t1"] - COST, 3) if r["r_t1"] is not None else None
+            r["r_t1_net"] = round(r["r_t1"] - COST, 3) if r.get("r_t1") is not None else None
             # 익절 수준별로 "그 규칙이었으면 어땠을까" 를 같이 남긴다.
             # 손절선은 실제 운용과 같은 -STOP_SD×σ 를 쓴다.
             sd = float(r.get("sd_daily") or 0.0)
@@ -240,9 +296,50 @@ def pipeline(rows: list[dict]) -> list[str]:
     return out
 
 
+def long_track(rows: list[dict]) -> list[str]:
+    """출발 신호 → 몇 달 뒤. 주도주를 가려내려는 질문에 답하는 부분.
+
+    T+5 는 단타 성과다. 여기서는 알림이 '출발' 이었던 종목이 20·60·120거래일
+    뒤 어디 있는지, 원인 유형별로 이어진 비율이 다른지를 본다."""
+    out = ["", "─" * 28, f"*장기 추적 — 출발 신호 이후* (이어진 종목 = T+60 ≥ +{LEADER_PCT:g}%)"]
+    any_long = False
+    for h in (20, 60, 120):
+        v = [r.get(f"r_t{h}") for r in rows if r.get(f"r_t{h}") is not None]
+        if v:
+            any_long = True
+            out.append(f"  T+{h:<3} {_stat(v)}")
+    if not any_long:
+        lead = max((r.get("days_after") or 0 for r in rows), default=0)
+        out.append(f"  아직 T+20 에 닿은 알림이 없습니다 (가장 앞선 알림 T+{lead}).")
+        return out
+    t60 = [r for r in rows if r.get("r_t60") is not None]
+    if t60:
+        hit = [r for r in t60 if r["r_t60"] >= LEADER_PCT]
+        out.append(f"  이어진 종목 {len(hit)}/{len(t60)}건 ({len(hit) / len(t60) * 100:.0f}%)")
+        by: dict[str, list] = {}
+        for r in t60:
+            by.setdefault(r.get("ctype") or "원인 미조회", []).append(r)
+        out.append("  _유형별 이어진 비율 (T+60)_")
+        for t, g in sorted(by.items(), key=lambda kv: -len(kv[1])):
+            k = sum(1 for r in g if r["r_t60"] >= LEADER_PCT)
+            out.append(f"   {t}: {k}/{len(g)}  평균 {statistics.fmean(r['r_t60'] for r in g):+.1f}%")
+    # 지금까지 가장 멀리 간 종목 — 이름과 원인을 눈으로 보고 공통점을 찾는 용도
+    top = sorted((r for r in rows if r.get("peak_ret") is not None and (r.get("days_after") or 0) >= 20),
+                 key=lambda r: -r["peak_ret"])[:5]
+    if top:
+        out.append("  _가장 멀리 간 알림 (최고 수익률, T+120 내)_")
+        for r in top:
+            d = str(r.get("date") or "")
+            out.append(f"   {r.get('name') or r.get('ticker')} {d[4:6]}/{d[6:]} "
+                       f"+{r['peak_ret']:.0f}% · {r.get('ctype') or '-'}")
+    return out
+
+
 def summarize(rows: list[dict]) -> str:
     void = [r for r in rows if r.get("void")]
     rows = [r for r in rows if not r.get("void")]
+    # 아래 익절 표가 'rows' 라는 이름을 다른 용도로 다시 쓰므로 미리 만들어 둔다
+    lt = long_track(rows)
     done = [r for r in rows if r.get("r_t5") is not None]
     lab = _label(rows)
     out = [f"📊 *신호 집계{' · ' + lab if lab else ''}* — 누적 알림 {len(rows)}건, "
@@ -283,6 +380,12 @@ def summarize(rows: list[dict]) -> str:
     cut("관심종목 경로", lambda r: str(r.get("trigger") or "") == "관심종목")
     cut("같은 날 재알림", lambda r: (r.get("alert_n") or 1) > 1)
     out.append("")
+    # 원인 유형별 — 어떤 종류의 급등이 이어지고 어떤 것이 꺼지는가
+    types = sorted({r.get("ctype") for r in done if r.get("ctype")})
+    for t in types:
+        cut(f"유형: {t}", lambda r, t=t: r.get("ctype") == t)
+    if types:
+        out.append("")
     # 이 갈래가 가장 흥미롭다 — 원인이 특정되지 않은 급변은 수급 충격일
     # 가능성이 높고, 그렇다면 되돌림이 나와야 한다. 가설의 1차 검증이다.
     cut("원인 미확인", lambda r: NO_EVENT in str(r.get("cause") or ""))
@@ -322,6 +425,8 @@ def summarize(rows: list[dict]) -> str:
             out.append(f"  → 현재 표본 최선: *{tag}* (평균 {best[0]:+.2f}%)")
             if len(sims) < 50:
                 out.append("  _표본 50건 전에는 순위가 계속 바뀝니다._")
+
+    out += lt
 
     # ── 재량의 기여 ────────────────────────────────────────────────────
     try:
@@ -382,8 +487,8 @@ def main():
     if not rows:
         log(f"{SIG} 가 비어 있습니다 — 알림이 쌓이면 채워집니다"); return
     n = fill(rows)
-    if n:
-        save_rows(rows)
+    # 장기 구간·기준점·원인 유형은 T+5 와 무관하게 매일 바뀐다 — 항상 저장한다.
+    save_rows(rows)
     log(f"수익률 채움 {n}건 / 전체 {len(rows)}건")
     text = summarize(rows)
     if a.send:
