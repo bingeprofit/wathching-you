@@ -1454,9 +1454,13 @@ def main():
                     help="시장 현지시각이 이 시각을 지났으면 즉시 종료 (서머타임 중복 크론 방어)")
     ap.add_argument("--skip-if-before", metavar="HH:MM",
                     help="시장 현지시각이 이 시각 전이면 즉시 종료 (앞 구간 잡과 겹치지 않게)")
-    ap.add_argument("--once-per-day", action="store_true",
-                    help="이 시장의 루프가 오늘(시장 날짜) 이미 돌았으면 즉시 종료. "
-                         "크론이 늦게 떠도 루프를 살리고, 서머타임 중복 크론은 이걸로 자른다")
+    ap.add_argument("--once-per-day", nargs="?", const="", default=None, metavar="KEY",
+                    help="이 시장의 루프가 오늘(시장 날짜) 이미 돌았으면 즉시 종료. 크론이 늦게 "
+                         "떠도 루프를 살리고, 중복·예비 크론은 이걸로 자른다. KEY 를 주면 구간별로 "
+                         "따로 센다 (한국 오전 am · 오후 pm)")
+    ap.add_argument("--wait-open", type=int, default=0, metavar="MIN",
+                    help="장 시작 전이면 최대 MIN 분까지 개장을 기다렸다가 시작. 크론을 정각 "
+                         "(가장 붐비는 때)보다 일찍 걸어 두기 위한 것")
     ap.add_argument("--max-minutes", type=int, default=340,
                     help="잡 최대 수명(분). GitHub Actions 6시간 한도 방어")
     ap.add_argument("--paper-probe", action="store_true",
@@ -1474,19 +1478,28 @@ def main():
     if a.skip_if_before and now < deadline_of(a.market, a.skip_if_before):
         log(f"{a.market.upper()} {now:%H:%M} — {a.skip_if_before} 이전이라 건너뜀 "
             "(아직 앞 구간 잡이 담당)"); return
+    # 오늘 이 구간 루프가 이미 돌았는지는 개장 대기·휴장 확인(최대 15분)보다 먼저 본다.
+    # 상태는 앞 잡이 '성공'으로 끝나야 캐시에 저장되므로, 앞 잡이 죽었으면 표시가
+    # 없어 이 잡이 이어받는다 (재시도). 정상 종료였으면 여기서 몇 초 만에 끝난다.
+    once_key = None
+    if a.once_per_day is not None and a.loop_until and not a.force:
+        once_key = "loop_ran" + (f"_{a.once_per_day}" if a.once_per_day else "")
+        ran = load_state(a.market).get(once_key)
+        if ran:
+            log(f"{a.market.upper()} {now:%H:%M} — 오늘 이 구간 루프는 이미 돌았습니다 "
+                f"({ran}) → 종료"); return
+    if a.wait_open and not a.force and not market_open(a.market):
+        limit = now + dt.timedelta(minutes=a.wait_open)
+        log(f"{a.market.upper()} {now:%H:%M} — 장 시작 전, 최대 {a.wait_open}분 개장 대기")
+        while not market_open(a.market) and dt.datetime.now(tz) < limit:
+            time.sleep(15)
+        now = dt.datetime.now(tz)
     if not a.force and not market_open(a.market):
         log(f"{a.market.upper()} 장 시간 아님 ({now:%H:%M}) → 종료"); return
     # 평일이어도 공휴일이면 KIS 가 전 거래일 스냅샷을 준다 → 그걸로 알리면 안 된다.
     # 개장 직후엔 오늘 봉·첫 체결이 늦을 수 있어 넉넉히(15분) 기다리지만, 장이 선 지
     # 30분이 넘었으면 3분이면 충분하다 — 미국 오후 단발 잡은 제한시간이 15분이라
     # 15분을 기다리면 휴장일마다 잡이 강제 종료된다.
-    # 오늘 루프가 이미 돌았는지는 휴장 확인(최대 15분 대기)보다 먼저 본다.
-    # 상태는 앞 잡이 '성공'으로 끝나야 캐시에 저장되므로, 앞 잡이 죽었으면 표시가
-    # 없어 이 잡이 이어받는다 (재시도). 정상 종료였으면 여기서 몇 초 만에 끝난다.
-    if a.once_per_day and a.loop_until and not a.force:
-        ran = load_state(a.market).get("loop_ran")
-        if ran:
-            log(f"{a.market.upper()} {now:%H:%M} — 오늘 루프는 이미 돌았습니다 ({ran}) → 종료"); return
     since_open = elapsed_frac(a.market) * SESSION_OF.get(a.market, 390)
     grace = 15 if since_open < 30 else 3
     if not a.force and a.market in ("kr", "us") and not wait_until_traded(kis_api(), a.market, grace):
@@ -1505,8 +1518,8 @@ def main():
               now + dt.timedelta(minutes=a.max_minutes))
     log(f"{a.market.upper()} 루프 시작 — {a.interval}초 간격, {end:%H:%M} 까지 "
         f"(범위 {a.universe})")
-    if a.once_per_day and not a.force:
-        st["loop_ran"] = f"{now:%H:%M} 시작"
+    if once_key:
+        st[once_key] = f"{now:%H:%M} 시작"
         save_state(a.market, st)
     n, sent, fail, nrows = 0, 0, 0, 0
     while dt.datetime.now(tz) < end:
