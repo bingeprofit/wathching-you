@@ -1,39 +1,60 @@
-name: 신호 성과 집계
+name: 미국 장중 급변동 모니터
 
-# 장중에는 '앞으로 어떻게 될지' 를 알 수 없다. 하루가 지나야 T+1 이 생긴다.
-# 그래서 장이 다 끝난 뒤 하루 한 번 돌면서 signals.jsonl 의 빈 칸을 채우고,
-# 신호에 엣지가 있는지 집계해 텔레그램으로 보낸다.
+# 시세는 KIS 해외주식 API. 미국은 KIS 문서 기준 실시간 무료(0분 지연)라
+# 1분 단위 감시가 실제로 성립한다 (아시아 시세만 15분 지연).
 #
-# 07:00 UTC = 16:00 KST — 한국장(~15:35 KST)이 끝난 뒤이고,
-# 미국장 루프(13:30~21:00 UTC)와도 겹치지 않는 유일한 구간이다.
-# 겹치면 두 잡이 같은 캐시를 서로 덮어써서 기록이 유실된다.
+# 미국 정규장 09:30~16:00 ET. cron 은 UTC 고정이라 서머타임을 모른다.
+#   EDT(3~11월, UTC-4) = 13:30~20:00 UTC
+#   EST(11~3월, UTC-5) = 14:30~21:00 UTC
+# 그래서 개장 크론을 13:30 / 14:30 둘 다 걸어두고 실제 판정은 monitor.py 가 ET 로
+# 다시 한다. EST 기간에 13:30 UTC 는 08:30 ET 라 '장 시간 아님' 으로 몇 초 만에 끝난다.
 #
-# 한국과 미국은 캐시가 따로라 signals.jsonl 도 둘이다. **잡을 둘로 나눠** 각각
-# 복원한다. 한 잡에서 미국 캐시를 state_us 폴더로 복원하려 했더니 한 번도
-# 복원되지 않았다 — actions/cache 는 저장할 때의 path 까지 캐시 버전에 넣기
-# 때문에, 장중 잡이 path: state 로 저장한 것은 path: state_us 로는 못 찾는다
-# ("Cache not found"). 그래서 미국 성과는 지금까지 한 건도 집계되지 않았다.
-# 두 잡 모두 장중 잡과 똑같이 path: state 를 쓴다.
+# 중복·지연 처리 (2026-10 변경): 예전엔 '10:15 ET 이후 시작이면 건너뜀' 으로 막았는데,
+# GitHub cron 이 45분 넘게 밀린 날은 그날 1분 감시가 통째로 날아갔다(10/5 엔 11:50 ET 에야 뜬 실행이 그대로 건너뜀).
+# 또 EDT 중복 크론(10:30 ET)은 항상 10:15 를 넘으므로 '앞 잡이 죽으면 이어받는다' 는
+# 재시도도 사실상 작동하지 않았다. 지금은 두 가드로 나눈다:
+#   --once-per-day   : 오늘 루프가 이미 돌았으면 종료. 표시는 상태 파일에 남고, 상태는
+#                      앞 잡이 '성공' 으로 끝나야 캐시에 저장되므로 앞 잡이 죽었으면
+#                      뒤 크론이 이어받는다 (재시도).
+#   --skip-if-after 12:00 : 12:25 까지 25분도 안 남으면 시작하지 않는다.
+# concurrency 가 같은 그룹이라 중복 크론은 앞 잡이 끝날 때까지 대기열에서 기다리고
+# (대기는 과금 안 됨), 시작하자마자 --once-per-day 로 몇 초 만에 끝난다.
+#
+# runs-on 은 ubuntu-24.04 로 고정한다. ubuntu-latest 는 2026-10-19 부터 Ubuntu 26 으로
+# 넘어가는데, 새 이미지에서 파이썬·캐시 동작이 바뀌어 장중에 깨지는 걸 피하려는 것.
+#
+# 잠든 시간대이므로 2단계로 나눈다:
+#   1단계 개장~12:25 ET : 60초 루프                    ← 순간급변 탐지
+#   2단계 12:26~16:00 ET: 1시간마다 단발 + 순위 2배   ← 누적 변동 탐지
+# 두 단계가 겹치면 뒤 잡이 앞 잡의 캐시를 덜 저장된 상태로 복원해 쿨다운이 풀린다.
+# 알림 상태는 **미국 날짜**로 리셋된다. 2단계는 한국 자정 이후에 돌기 때문에,
+# 예전처럼 한국 날짜를 쓰면 오전에 알린 종목을 잊고 같은 종목을 또 보냈다.
+# 1단계를 12:25 에 끊고 2단계를 12:26 부터로 막아 간격을 둔다.
+#
+# 주의: YAML 앵커(&, *)는 GitHub Actions 파서가 지원하지 않아 env 를 그대로 반복한다.
 
 on:
   schedule:
-    - cron: "0 7 * * 1-5"
+    - cron: "30 13 * * 1-5"       # EDT 개장 (= 09:30 ET)
+    - cron: "30 14 * * 1-5"       # EST 개장 (= 09:30 ET)
+    - cron: "0 16-21 * * 1-5"     # 2단계 (양쪽 서머타임 구간을 모두 덮는다)
   workflow_dispatch:
     inputs:
-      attach:
-        description: "원본 jsonl 도 텔레그램에 첨부 (분석용)"
+      force:
+        description: "장 시간을 무시하고 즉시 1회 스캔 (연결 테스트용)"
         type: boolean
         default: false
 
 concurrency:
-  group: signal-review
+  group: intraday-us-${{ github.event.schedule == '0 16-21 * * 1-5' && 'tail' || 'open' }}
   cancel-in-progress: false
 
 jobs:
-  review_kr:
-    name: 한국 신호 집계
-    runs-on: ubuntu-latest
-    timeout-minutes: 20
+  # ── 1단계: 개장 후 약 3시간, 60초 루프 ─────────────────────────────────
+  burst:
+    if: github.event.schedule != '0 16-21 * * 1-5'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 215
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -42,59 +63,6 @@ jobs:
           cache: pip
       - run: pip install -r requirements.txt
 
-      # 장중 잡과 같은 path(state)·같은 접두어라야 복원된다. 채운 결과는 새 키로
-      # 저장되고, 다음 장중 잡이 그걸(가장 최신) 이어받는다.
-      - name: 상태 복원
-        uses: actions/cache@v4
-        with:
-          path: state
-          key: intraday-kr-${{ github.run_id }}
-          restore-keys: intraday-kr-
-
-      - name: 복원 확인
-        run: |
-          if [ -f state/signals.jsonl ]; then
-            echo "signals.jsonl $(wc -l < state/signals.jsonl)줄 복원"
-          else
-            echo "::warning::한국 알림 기록(state/signals.jsonl)이 없습니다 — 장중 잡이 아직 한 번도 저장하지 못했을 수 있습니다"
-          fi
-
-      - name: 수익률 채우고 집계
-        env:
-          TELEGRAM_TOKEN:   ${{ secrets.TELEGRAM_TOKEN }}
-          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-          KIS_APP_KEY:      ${{ secrets.KIS_APP_KEY }}
-          KIS_APP_SECRET:   ${{ secrets.KIS_APP_SECRET }}
-          ROUND_TRIP_PCT:   "0.55"
-          # 익절 수준을 여러 개 동시에 시뮬레이션한다. 0 은 익절 없이
-          # T+5·손절만 쓰는 기준선. 손절선은 실제 운용과 같은 값을 쓴다.
-          TP_GRID:          "0,3,5,8,12"
-          STOP_SD:          "1.5"
-          HOLD_DAYS:        "5"
-          STATE_DIR:        "state"
-          MARKET_LABEL:     "한국"
-        run: |
-          python backfill.py --send \
-            ${{ github.event.inputs.attach == 'true' && '--attach' || '' }}
-
-  # 미국은 왕복 비용이 낮다 (증권거래세 없음, 수수료 + 슬리피지만).
-  # needs 로 한국 다음에 돈다 — KIS 토큰 발급(분당 1회)이 겹치지 않게.
-  review_us:
-    name: 미국 신호 집계
-    needs: review_kr
-    if: always()
-    runs-on: ubuntu-latest
-    timeout-minutes: 20
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
-          cache: pip
-      - run: pip install -r requirements.txt
-
-      # 장중 잡과 같은 path(state)·같은 접두어라야 복원된다. 채운 결과는 새 키로
-      # 저장되고, 다음 장중 잡이 그걸(가장 최신) 이어받는다.
       - name: 상태 복원
         uses: actions/cache@v4
         with:
@@ -102,28 +70,120 @@ jobs:
           key: intraday-us-${{ github.run_id }}
           restore-keys: intraday-us-
 
-      - name: 복원 확인
+      - name: 감시 루프 (개장~12:25 ET)
+        env:
+          ANTHROPIC_API_KEY:      ${{ secrets.ANTHROPIC_API_KEY }}
+          ANTHROPIC_WORKSPACE_ID: ${{ secrets.ANTHROPIC_WORKSPACE_ID }}
+          TELEGRAM_TOKEN:         ${{ secrets.TELEGRAM_TOKEN }}
+          TELEGRAM_CHAT_ID:       ${{ secrets.TELEGRAM_CHAT_ID }}
+          KIS_APP_KEY:            ${{ secrets.KIS_APP_KEY }}
+          KIS_APP_SECRET:         ${{ secrets.KIS_APP_SECRET }}
+          # 관심종목은 Variables 가 아니라 Secrets 로. 공개 저장소에서는 Variables 가
+          # 로그에 평문으로 남는다. 비워 두면 monitor.py 의 기본 목록을 쓴다.
+          US_WATCHLIST:           ${{ secrets.US_WATCHLIST }}
+          QUIET_LOG:     "1"      # 로그에 종목명을 남기지 않는다 (공개 저장소)
+          Z_THRESHOLD:   "3.0"
+          MIN_ABS_PCT:   "4.0"
+          VOL_RATIO_MIN: "1.8"
+          BURST_MIN:     "5"
+          BURST_Z:       "3.5"
+          BURST_MIN_PCT: "2.0"
+          MAX_ALERTS:    "4"
+          MAX_PER_HOUR:  "8"
+          MAX_PER_DAY:   "20"
+          # ── 같은 날 재알림 ─────────────────────────────────
+          # 쿨다운이 지나도, 직전 알림보다 max(5%p, 50%) 이상 더 갔거나
+          # 방향이 뒤집혔을 때만 다시 알린다. 종목당 하루 2회까지.
+          COOLDOWN_MIN:  "120"
+          REALERT_PP:         "5"
+          REALERT_REL:        "0.5"
+          MAX_PER_TICKER_DAY: "2"
+          # ── 페니·펌프 종목 제외 (관심종목은 면제) ──────────────
+          MIN_PRICE_USD:    "5"      # 전일종가 $5 미만 제외 ($1→$6 급등도 걸린다)
+          MIN_TURNOVER_USD: "1e7"    # 일환산 거래대금 $10M 미만 제외
+          MAX_SD_PCT_US:    "12"     # 최근 20일 일간 σ 12% 초과 제외 (복권형)
+          DD_MAX_PCT:       "60"     # 100거래일 최고 종가 대비 -60% 이하 제외
+          # ── 관심종목(US_WATCHLIST 또는 기본 목록) 은 문턱을 낮춰 따로 ──
+          # |등락| 2%↑ + 2σ↑, 거래량 무관, SPY 대비 초과 2%p↑. 한 번에 2개까지.
+          CORE_MIN_ABS_PCT:  "2.0"
+          CORE_Z:            "2.0"
+          CORE_MIN_REL_PCT:  "2.0"
+          CORE_MAX_PER_SCAN: "2"
+          RANK_N:        "20"
+          SURGE_N:       "10"
+          TRACK_MAX:     "40"
+          WORKERS:       "4"
         run: |
-          if [ -f state/signals.jsonl ]; then
-            echo "signals.jsonl $(wc -l < state/signals.jsonl)줄 복원"
+          if [ "${{ github.event.inputs.force }}" = "true" ]; then
+            python monitor.py --market us --force
           else
-            echo "::warning::미국 알림 기록(state/signals.jsonl)이 없습니다 — 장중 잡이 아직 한 번도 저장하지 못했을 수 있습니다"
+            python monitor.py --market us \
+              --loop-until 12:25 --interval 60 \
+              --skip-if-after 12:00 --once-per-day --max-minutes 200
           fi
 
-      - name: 수익률 채우고 집계
+  # ── 2단계: 마감까지 1시간마다 단발, 순위를 2배 깊게 ─────────────────────
+  tail:
+    if: github.event.schedule == '0 16-21 * * 1-5'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+      - run: pip install -r requirements.txt
+
+      - name: 상태 복원
+        uses: actions/cache@v4
+        with:
+          path: state
+          key: intraday-us-${{ github.run_id }}
+          restore-keys: intraday-us-
+
+      - name: 단발 스캔
         env:
-          TELEGRAM_TOKEN:   ${{ secrets.TELEGRAM_TOKEN }}
-          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-          KIS_APP_KEY:      ${{ secrets.KIS_APP_KEY }}
-          KIS_APP_SECRET:   ${{ secrets.KIS_APP_SECRET }}
-          ROUND_TRIP_PCT:   "0.25"
-          # 익절 수준을 여러 개 동시에 시뮬레이션한다. 0 은 익절 없이
-          # T+5·손절만 쓰는 기준선. 손절선은 실제 운용과 같은 값을 쓴다.
-          TP_GRID:          "0,3,5,8,12"
-          STOP_SD:          "1.5"
-          HOLD_DAYS:        "5"
-          STATE_DIR:        "state"
-          MARKET_LABEL:     "미국"
+          ANTHROPIC_API_KEY:      ${{ secrets.ANTHROPIC_API_KEY }}
+          ANTHROPIC_WORKSPACE_ID: ${{ secrets.ANTHROPIC_WORKSPACE_ID }}
+          TELEGRAM_TOKEN:         ${{ secrets.TELEGRAM_TOKEN }}
+          TELEGRAM_CHAT_ID:       ${{ secrets.TELEGRAM_CHAT_ID }}
+          KIS_APP_KEY:            ${{ secrets.KIS_APP_KEY }}
+          KIS_APP_SECRET:         ${{ secrets.KIS_APP_SECRET }}
+          US_WATCHLIST:           ${{ secrets.US_WATCHLIST }}
+          QUIET_LOG:     "1"
+          Z_THRESHOLD:   "3.0"
+          MIN_ABS_PCT:   "4.0"
+          VOL_RATIO_MIN: "1.8"
+          # 1시간 간격이면 '최근 5분'을 볼 수 없다. 직전 스캔과의 간격에 맞춘다.
+          # 체결 이력은 state/ 에 저장돼 실행 간에 넘어가므로 단발에서도 작동한다.
+          BURST_MIN:     "60"
+          BURST_Z:       "3.5"
+          BURST_MIN_PCT: "3.0"
+          MAX_ALERTS:    "6"
+          MAX_PER_HOUR:  "8"
+          MAX_PER_DAY:   "20"
+          # ── 같은 날 재알림 ─────────────────────────────────
+          # 쿨다운이 지나도, 직전 알림보다 max(5%p, 50%) 이상 더 갔거나
+          # 방향이 뒤집혔을 때만 다시 알린다. 종목당 하루 2회까지.
+          COOLDOWN_MIN:  "120"
+          REALERT_PP:         "5"
+          REALERT_REL:        "0.5"
+          MAX_PER_TICKER_DAY: "2"
+          # ── 페니·펌프 종목 제외 (관심종목은 면제) ──────────────
+          MIN_PRICE_USD:    "5"      # 전일종가 $5 미만 제외 ($1→$6 급등도 걸린다)
+          MIN_TURNOVER_USD: "1e7"    # 일환산 거래대금 $10M 미만 제외
+          MAX_SD_PCT_US:    "12"     # 최근 20일 일간 σ 12% 초과 제외 (복권형)
+          DD_MAX_PCT:       "60"     # 100거래일 최고 종가 대비 -60% 이하 제외
+          # ── 관심종목(US_WATCHLIST 또는 기본 목록) 은 문턱을 낮춰 따로 ──
+          # |등락| 2%↑ + 2σ↑, 거래량 무관, SPY 대비 초과 2%p↑. 한 번에 2개까지.
+          CORE_MIN_ABS_PCT:  "2.0"
+          CORE_Z:            "2.0"
+          CORE_MIN_REL_PCT:  "2.0"
+          CORE_MAX_PER_SCAN: "2"
+          RANK_N:        "20"
+          SURGE_N:       "10"
+          TRACK_MAX:     "40"
+          WORKERS:       "4"
         run: |
-          python backfill.py --send \
-            ${{ github.event.inputs.attach == 'true' && '--attach' || '' }}
+          python monitor.py --market us --universe full --skip-if-before 12:26
