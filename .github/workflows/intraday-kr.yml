@@ -44,7 +44,7 @@ concurrency:
 
 jobs:
   watch:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04   # ubuntu-latest 는 10/19 부터 Ubuntu 26 — 고정
     timeout-minutes: 240
     steps:
       - uses: actions/checkout@v4
