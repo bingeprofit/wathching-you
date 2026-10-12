@@ -28,7 +28,7 @@
 쿨다운·이력은 월물이 아니라 품목(ES, GC …) 단위로 걸어 롤오버에 흔들리지 않게 한다.
 """
 from __future__ import annotations
-import argparse, json, os, re, statistics, time, datetime as dt
+import argparse, atexit, json, os, re, statistics, time, datetime as dt
 from collections import deque
 from zoneinfo import ZoneInfo
 import requests
@@ -1106,6 +1106,39 @@ def _attrib_client():
                                default_headers={"anthropic-workspace-id": ws} if ws else None)
 
 
+# ── Anthropic 사용량 집계 ────────────────────────────────────────────────
+# 잡이 끝날 때 한 줄 요약을 GitHub 주석(::notice::)으로 남긴다. 로그는 몇 시간짜리라
+# 찾기 어렵지만 주석은 실행 요약 화면에 바로 보이고 API 로도 모을 수 있다.
+# 단가 ($/MTok): 입력·출력·캐시읽기·캐시쓰기, 웹검색은 회당 $0.01.
+PRICE = {"sonnet": (2.0, 10.0, 0.2, 2.5), "haiku": (1.0, 5.0, 0.1, 1.25), "opus": (5.0, 25.0, 0.5, 6.25)}
+_USE = {"calls": 0, "in": 0, "out": 0, "cr": 0, "cw": 0, "search": 0}
+
+
+def _use_add(u) -> None:
+    g = lambda k: int(getattr(u, k, 0) or 0)
+    _USE["calls"] += 1
+    _USE["in"] += g("input_tokens"); _USE["out"] += g("output_tokens")
+    _USE["cr"] += g("cache_read_input_tokens"); _USE["cw"] += g("cache_creation_input_tokens")
+    _USE["search"] += int(getattr(getattr(u, "server_tool_use", None), "web_search_requests", 0) or 0)
+
+
+def use_cost() -> float:
+    m = next((v for k, v in PRICE.items() if k in CFG["MODEL"].lower()), PRICE["sonnet"])
+    return (_USE["in"] * m[0] + _USE["out"] * m[1] + _USE["cr"] * m[2] + _USE["cw"] * m[3]) / 1e6 \
+        + _USE["search"] * 0.01
+
+
+@atexit.register
+def _use_report() -> None:
+    if not _USE["calls"]:
+        return
+    line = (f"호출 {_USE['calls']}회 · 검색 {_USE['search']}회 · 입력 {_USE['in']:,} · 출력 {_USE['out']:,} · "
+            f"캐시읽기 {_USE['cr']:,} 토큰 → 약 ${use_cost():.2f}")
+    log("Anthropic 사용량: " + line)
+    if os.environ.get("GITHUB_ACTIONS"):
+        print(f"::notice title=Anthropic 사용량 ({os.environ.get('GITHUB_JOB', '')})::{line}", flush=True)
+
+
 NEWS_SYSTEM = SYSTEM.replace("웹 검색으로 확인한", "아래에 주어진 기사·공시 목록에서 확인되는") + """
 
 [이번 작업] 웹 검색은 쓸 수 없다. 종목마다 최근 24시간 네이버 뉴스·공시 제목 목록이 주어진다.
@@ -1171,6 +1204,7 @@ def _attribute_news(picks: list[dict], heads: dict) -> dict:
         return {}
     text = "".join(b.text for b in msg.content if getattr(b, "type", "") == "text")
     u = msg.usage
+    _use_add(u)
     log(f"귀인(기사): 토큰 in {getattr(u, 'input_tokens', 0):,} / out {getattr(u, 'output_tokens', 0):,}")
     items = parse_items(text, stop=getattr(msg, "stop_reason", None))
     return {i.get("ticker"): i for i in items if i.get("ticker")}
@@ -1219,6 +1253,7 @@ def _attribute_web(picks: list[dict], market: str) -> dict:
     text = "".join(b.text for b in msg.content if getattr(b, "type", "") == "text")
     text = re.sub(r"[<(]\s*/?\s*cite\b[^>)]*[>)]?", "", text).replace("</cite>", "")
     u = msg.usage
+    _use_add(u)
     log(f"귀인: 검색 {getattr(getattr(u,'server_tool_use',None),'web_search_requests',0) or 0}회, "
         f"토큰 in {getattr(u,'input_tokens',0):,} / out {getattr(u,'output_tokens',0):,}")
     items = parse_items(text, stop=getattr(msg, "stop_reason", None))
