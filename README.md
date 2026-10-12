@@ -615,8 +615,8 @@ python monitor.py --market fut --force \
 | `BURST_Z` | 3.5 | 순간 경로 임계. **알림이 너무 많으면 여기부터 올리세요** |
 | `BURST_MIN_PCT` | 2.0 | 순간 변동 최소 폭(%) |
 | `MAX_ALERTS` | 4 | 1회 스캔당 상한 |
-| `MAX_PER_HOUR` | 8 | 시간당 상한 |
-| `MAX_PER_DAY` | 30 / 20 | 하루 상한. 한국 / 미국 (**비용을 묶는 핵심 손잡이**) |
+| `MAX_PER_HOUR` | 10 | 시간당 상한 (2026-10-13 8→10) |
+| `MAX_PER_DAY` | 40 / 30 | 하루 상한. 한국 / 미국 (2026-10-13 미국 20→30) (**비용을 묶는 핵심 손잡이**) |
 | `COOLDOWN_MIN` | 120 | 같은 종목 재알림 최소 간격(분) |
 | `REALERT_PP` / `REALERT_REL` | 5 / 0.5 | 재알림 조건 — 직전 알림보다 max(5%p, 50%) 더 갔을 때 |
 | `MAX_PER_TICKER_DAY` | 2 | 종목당 하루 알림 상한 |

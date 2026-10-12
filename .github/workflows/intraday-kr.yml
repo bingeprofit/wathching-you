@@ -140,7 +140,7 @@ jobs:
           BURST_Z:       "3.5"
           BURST_MIN_PCT: "2.0"
           MAX_ALERTS:    "4"
-          MAX_PER_HOUR:  "8"
+          MAX_PER_HOUR:  "10"
           MAX_PER_DAY:   "40"
           # ── 체결성 필터 (한국만) ─────────────────────────────
           # 급등률 상위는 가벼운 종목이 지배한다. 호가가 얇으면 +20% 가

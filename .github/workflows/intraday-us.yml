@@ -89,8 +89,8 @@ jobs:
           BURST_Z:       "3.5"
           BURST_MIN_PCT: "2.0"
           MAX_ALERTS:    "4"
-          MAX_PER_HOUR:  "8"
-          MAX_PER_DAY:   "20"
+          MAX_PER_HOUR:  "10"
+          MAX_PER_DAY:   "30"
           # ── 같은 날 재알림 ─────────────────────────────────
           # 쿨다운이 지나도, 직전 알림보다 max(5%p, 50%) 이상 더 갔거나
           # 방향이 뒤집혔을 때만 다시 알린다. 종목당 하루 2회까지.
@@ -165,8 +165,8 @@ jobs:
           BURST_Z:       "3.5"
           BURST_MIN_PCT: "3.0"
           MAX_ALERTS:    "6"
-          MAX_PER_HOUR:  "8"
-          MAX_PER_DAY:   "20"
+          MAX_PER_HOUR:  "10"
+          MAX_PER_DAY:   "30"
           # ── 같은 날 재알림 ─────────────────────────────────
           # 쿨다운이 지나도, 직전 알림보다 max(5%p, 50%) 이상 더 갔거나
           # 방향이 뒤집혔을 때만 다시 알린다. 종목당 하루 2회까지.
