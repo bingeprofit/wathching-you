@@ -852,6 +852,9 @@ def scan_us(universe: str = "focus") -> list[dict]:
 # ── 시가총액·종목 종류 ──────────────────────────────────────────────────
 _MCAP: dict = {}
 _SPAC = re.compile(r"ACQUISITION|BLANK CHECK|\bSPAC\b|CAPITAL INVESTM", re.I)
+_ETFNAME = re.compile(r"\bETF\b|\bETN\b|\bFUND\b|\bFD\b|\bTRUST\b|\bTR\b|\b[23]X\b|ULTRA|DAILY", re.I)
+_CORPNAME = re.compile(r"\b(INC|CORP|CORPORATION|CO|COMPANY|LTD|LIMITED|PLC|HOLDINGS?|HLDGS|GROUP|SA|NV|AG|SE|"
+                       r"LLC|BANCORP|THERAPEUTICS|TECHNOLOGIES|PHARMACEUTICALS)\b\.?", re.I)
 _NONCOMMON = re.compile(r"\bWTS?\b|WARRANT|\bUNITS?\b|\bRIGHTS?\b|\d+(\.\d+)?%|\bPERP|\bPFD\b|PREFERRED"
                         r"|\bNOTES?\b|DEBENTURE", re.I)
 
@@ -946,9 +949,12 @@ def _too_thin_us(r: dict) -> str:
         if (CFG["MIN_MCAP_USD"] and not spac and mi.get("mcap")
                 and mi["mcap"] < CFG["MIN_MCAP_USD"]):
             return f"시총 ${CFG['MIN_MCAP_USD'] / 1e6:,.0f}M 미만"
-    elif CFG["US_COMMON_ONLY"] and re.search(r"\bETF\b|\bETN\b|\bFUND\b|\bFD\b|\bTRUST\b|\bTR\b|2X|3X|ULTRA|DAILY", name, re.I) \
-            and not spac:
-        return "ETF·ETN(레버리지 포함)"
+    elif CFG["US_COMMON_ONLY"] and not spac:
+        # 네이버 미국 시총 목록에는 보통주만 있다 (2026-10-12 러너 확인: ETF·워런트·우선주 없음).
+        # 목록에 없으면서 이름이 회사 같지 않으면(GLD·UNG·'2X LONG … DAILY ETF' 등) ETF 류로 본다.
+        # 상장 며칠 된 신규 상장사는 목록에 늦게 올라오므로 INC·CORP 같은 이름이면 살린다.
+        if _ETFNAME.search(name) or (_MCAP.get("us") and not _CORPNAME.search(name)):
+            return "ETF·ETN(레버리지 포함)"
     lo, pc = CFG["MIN_PRICE_USD"], prev_close_of(r)
     if lo and 0 < pc < lo:
         return f"전일종가 ${lo:g} 미만"
@@ -1631,6 +1637,10 @@ def main():
             log(f"{a.market.upper()} {now:%H:%M} — 오늘 이 구간 루프는 이미 돌았습니다 "
                 f"({ran}) → 종료"); return
     if a.wait_open and not a.force and not market_open(a.market):
+        # 시총 목록(하루 1회, 약 1분)을 개장 대기 시간에 미리 받아 첫 스캔이 늦지 않게
+        if a.market == "kr" and CFG["MIN_MCAP_KRW"] or a.market == "us" and (
+                CFG["US_COMMON_ONLY"] or CFG["MIN_MCAP_USD"]):
+            mcap_info(a.market, "")
         limit = now + dt.timedelta(minutes=a.wait_open)
         log(f"{a.market.upper()} {now:%H:%M} — 장 시작 전, 최대 {a.wait_open}분 개장 대기")
         while not market_open(a.market) and dt.datetime.now(tz) < limit:
