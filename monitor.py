@@ -87,6 +87,16 @@ CFG = {
     # 한 번 펌프됐다 1/N 로 가라앉은 종목은 같은 패턴을 되풀이한다. 전일 종가가
     # 약 100거래일 최고 종가보다 DD_MAX_PCT % 이상 아래면 제외. 0 이면 끔.
     "DD_MAX_PCT":        float(env("DD_MAX_PCT", "60")),
+    # ── 시가총액·종목 종류 (2026-10-12) ─────────────────────────────────
+    # 9/21~10/12 알림 730건 점검: 한국 알림의 56% 가 시총 1천억 미만이었고 다음날
+    # 중앙값 −4.9%·5일 승률 31%. 미국 $300M 미만은 다음날 −8.1%. 미국은 2배 레버리지
+    # ETF·워런트·우선주가 18% 였고 한 사건(10/2 STX)에 2배 ETF 넷이 따로 알림이 갔다.
+    # 시총·종류는 네이버페이 증권 목록(naver_ref.py)으로 하루 한 번 받는다. 관심종목은 면제.
+    "MIN_MCAP_KRW":      float(env("MIN_MCAP_KRW", "1e11")),     # 1,000억. 0 이면 끔
+    "MIN_MCAP_USD":      float(env("MIN_MCAP_USD", "3e8")),      # $300M. 0 이면 끔
+    # 미국은 보통주만 (ETF·ETN·레버리지·워런트·유닛·우선주 제외). SPAC 은 우회상장 같은
+    # 특수 상황이 있어 남기고 시총 하한도 면제한다 (신탁 현금이라 대개 $300M 미만).
+    "US_COMMON_ONLY":    env("US_COMMON_ONLY", "1") == "1",
     # ── 체결 가능성 필터 (한국) ──────────────────────────────────────────
     # 급등률 순위 상위는 가벼운 종목이 지배한다. 호가가 얇으면 +20% 가 몇 억으로
     # 만들어지고, 사러 들어가는 순간 그 폭이 사라진다. z 는 변동성으로 정규화할 뿐
@@ -97,7 +107,12 @@ CFG = {
     "MIN_TURNOVER_KRW": float(env("MIN_TURNOVER_KRW", "5e9")),   # 일 환산 거래대금 하한(원)
     "MIN_PRICE_KRW":    float(env("MIN_PRICE_KRW", "1000")),     # 주가 하한 (호가단위 노이즈 방어)
     "MAX_SD_PCT":       float(env("MAX_SD_PCT", "0")),           # 일간 σ 상한(%). 0 이면 끔
-    "SEARCH_PER_NAME": int(env("SEARCH_PER_NAME", "2")),
+    "SEARCH_PER_NAME": int(env("SEARCH_PER_NAME", "1")),     # 종목당 웹검색 (2026-10-12: 2→1)
+    # 한국은 웹검색 대신 네이버 종목 뉴스·공시 제목(최근 24시간)을 붙여 Claude 가 그 안에서만
+    # 원인을 고르게 한다. 9/21~10/12 한국 귀인의 70% 가 '확인된 촉발 사건 없음' 이었다 —
+    # 웹검색 비용 대부분이 원인 없는 소형주에 쓰였다. 기사·공시가 하나도 없으면 Claude 를
+    # 부르지 않는다. 목록을 받지 못한 종목만 예전처럼 웹검색으로 찾는다.
+    "KR_NEWS_ATTRIB":  env("KR_NEWS_ATTRIB", "1") == "1",
     "MODEL":         env("ATTRIB_MODEL", "claude-sonnet-5"),
     "MAX_TOKENS":    int(env("ATTRIB_MAX_TOKENS", "8000")),
     "BURST_MIN":     int(env("BURST_MIN", "5")),          # 순간 변동 측정 구간(분)
@@ -834,6 +849,31 @@ def scan_us(universe: str = "focus") -> list[dict]:
     return build_rows(api, "us", cand)
 
 
+# ── 시가총액·종목 종류 ──────────────────────────────────────────────────
+_MCAP: dict = {}
+_SPAC = re.compile(r"ACQUISITION|BLANK CHECK|\bSPAC\b|CAPITAL INVESTM", re.I)
+_NONCOMMON = re.compile(r"\bWTS?\b|WARRANT|\bUNITS?\b|\bRIGHTS?\b|\d+(\.\d+)?%|\bPERP|\bPFD\b|PREFERRED"
+                        r"|\bNOTES?\b|DEBENTURE", re.I)
+
+
+def mcap_info(market: str, code: str) -> dict | None:
+    """{mcap, type} 또는 None(목록에 없음). 목록을 못 받았으면 None."""
+    if market not in _MCAP:
+        try:
+            import naver_ref as NR
+            _MCAP[market] = NR.load_mcap(market, STATE_DIR, session_date(market), log)
+        except Exception as e:
+            log(f"시총 목록 실패({type(e).__name__}) — 시총·종류 필터 없이 진행")
+            _MCAP[market] = {}
+    rows = _MCAP[market]
+    if not rows:
+        return None
+    if market == "us":
+        import naver_ref as NR
+        return rows.get(NR.norm_us(code))
+    return rows.get(str(code).zfill(6))
+
+
 # ── 선별 ─────────────────────────────────────────────────────────────────
 def prev_close_of(r: dict) -> float:
     """전일 종가. 스냅샷의 현재가·등락률로 되짚는 것이 가장 확실하고(일봉 API 가
@@ -871,6 +911,9 @@ def too_thin(r: dict) -> str:
     lo = CFG["MIN_PRICE_KRW"]
     if lo and 0 < px < lo:
         return f"주가 {lo:,.0f}원 미만"
+    mi = mcap_info("kr", r["ticker"]) if CFG["MIN_MCAP_KRW"] else None
+    if mi and mi.get("type") == "stock" and mi.get("mcap") and mi["mcap"] < CFG["MIN_MCAP_KRW"]:
+        return f"시총 {CFG['MIN_MCAP_KRW'] / 1e8:,.0f}억 미만"
 
     val = float(r.get("value") or 0)
     need = CFG["MIN_TURNOVER_KRW"]
@@ -889,6 +932,23 @@ def too_thin(r: dict) -> str:
 
 
 def _too_thin_us(r: dict) -> str:
+    name = str(r.get("name") or "")
+    spac = bool(_SPAC.search(name))
+    if CFG["US_COMMON_ONLY"]:
+        # BRK/B·BF/B 같은 보통주 클래스는 살리고, /U·/WS·/R (유닛·워런트·권리) 만 뺀다
+        tail = str(r["ticker"]).split("/", 1)[1].upper() if "/" in str(r["ticker"]) else ""
+        if tail in ("U", "UN", "W", "WS", "WT", "R", "RT") or _NONCOMMON.search(name):
+            return "보통주 아님(워런트·유닛·우선주 등)"
+    mi = mcap_info("us", r["ticker"]) if (CFG["US_COMMON_ONLY"] or CFG["MIN_MCAP_USD"]) else None
+    if mi:
+        if CFG["US_COMMON_ONLY"] and mi.get("type") not in (None, "stock"):
+            return "ETF·ETN(레버리지 포함)"
+        if (CFG["MIN_MCAP_USD"] and not spac and mi.get("mcap")
+                and mi["mcap"] < CFG["MIN_MCAP_USD"]):
+            return f"시총 ${CFG['MIN_MCAP_USD'] / 1e6:,.0f}M 미만"
+    elif CFG["US_COMMON_ONLY"] and re.search(r"\bETF\b|\bETN\b|\bFUND\b|\bFD\b|\bTRUST\b|\bTR\b|2X|3X|ULTRA|DAILY", name, re.I) \
+            and not spac:
+        return "ETF·ETN(레버리지 포함)"
     lo, pc = CFG["MIN_PRICE_USD"], prev_close_of(r)
     if lo and 0 < pc < lo:
         return f"전일종가 ${lo:g} 미만"
@@ -1040,7 +1100,77 @@ def _attrib_client():
                                default_headers={"anthropic-workspace-id": ws} if ws else None)
 
 
+NEWS_SYSTEM = SYSTEM.replace("웹 검색으로 확인한", "아래에 주어진 기사·공시 목록에서 확인되는") + """
+
+[이번 작업] 웹 검색은 쓸 수 없다. 종목마다 최근 24시간 네이버 뉴스·공시 제목 목록이 주어진다.
+그 목록 안에서 급등락을 설명하는 사건을 고른다. 목록에 그런 사건이 없으면 cause 를
+"확인된 촉발 사건 없음" 으로 둔다. sources 의 url 은 비워 두고 title 에 기사·공시 제목을 쓴다."""
+
+
 def attribute(picks: list[dict], market: str) -> dict:
+    """원인 귀인. 한국은 네이버 기사·공시 → (없으면 생략), 받지 못한 종목만 웹검색."""
+    if not picks:
+        return {}
+    if market != "kr" or not CFG["KR_NEWS_ATTRIB"]:
+        return _attribute_web(picks, market)
+    try:
+        import naver_ref as NR
+    except Exception:
+        return _attribute_web(picks, market)
+    heads, out, web = {}, {}, []
+    for r in picks:
+        got, items = NR.kr_headlines(r["ticker"])
+        if not got:
+            web.append(r)                         # 목록 자체를 못 받음 → 예전 방식
+        elif not items:
+            out[r["ticker"]] = {"ticker": r["ticker"], "confidence": "low",
+                                "cause": "확인된 촉발 사건 없음 (최근 24시간 기사·공시 없음)"}
+        else:
+            heads[r["ticker"]] = items
+    with_news = [r for r in picks if r["ticker"] in heads]
+    if with_news:
+        out.update(_attribute_news(with_news, heads))
+    if web:
+        out.update(_attribute_web(web, market))
+    log(f"귀인(한국): 기사 있음 {len(with_news)} · 기사 없음 {sum(1 for v in out.values() if '기사·공시 없음' in str(v.get('cause')))}"
+        f" · 웹검색 {len(web)}")
+    return out
+
+
+def _attribute_news(picks: list[dict], heads: dict) -> dict:
+    cli = _attrib_client()
+    if cli is None:
+        return {}
+    now = dt.datetime.now(KST)
+    lines = [f"한국 증시 — 현재 {now:%Y-%m-%d %H:%M} KST", "",
+             "아래 종목이 평소 변동성 대비 이례적으로 크게 움직이고 있다.",
+             "종목마다 붙은 최근 기사·공시 목록에서 원인을 찾아라.", ""]
+    for r in picks:
+        nm = r.get("name") or r["ticker"]
+        lines.append(f"## {nm} ({r['ticker']})  {r['pct']:+.1f}%  (일간변동성 대비 {r.get('z', 0):+.1f}σ) "
+                     f"[{r.get('trigger', '')}]")
+        lines += [f"- {h}" for h in heads.get(r["ticker"], [])]
+        lines.append("")
+    lines += [f'각 종목을 items 에 하나씩, ticker 는 "{picks[0]["ticker"]}" 형식 그대로 쓴다.']
+    try:
+        msg = cli.messages.create(
+            model=CFG["MODEL"], max_tokens=min(CFG["MAX_TOKENS"], 3000),
+            system=[{"type": "text", "text": NEWS_SYSTEM, "cache_control": {"type": "ephemeral"}}],
+            messages=[{"role": "user", "content": "\n".join(lines)}])
+    except Exception as e:
+        m = str(e)
+        log(f"귀인(기사) API 실패: {m[:300]}")
+        if "anthropic-workspace-id" in m:
+            log("  → 조직 범위 키입니다. ANTHROPIC_WORKSPACE_ID 를 설정하세요.")
+        return {}
+    text = "".join(b.text for b in msg.content if getattr(b, "type", "") == "text")
+    u = msg.usage
+    log(f"귀인(기사): 토큰 in {getattr(u, 'input_tokens', 0):,} / out {getattr(u, 'output_tokens', 0):,}")
+    items = parse_items(text, stop=getattr(msg, "stop_reason", None))
+    return {i.get("ticker"): i for i in items if i.get("ticker")}
+
+
+def _attribute_web(picks: list[dict], market: str) -> dict:
     cli = _attrib_client()
     if cli is None or not picks:
         return {}
@@ -1365,7 +1495,7 @@ def render(picks: list[dict], attrib: dict, market: str) -> str:
 _BUDGET_SEEN: dict = {}
 
 
-def mark_sent(st: dict, picks: list[dict], now: float | None = None) -> None:
+def mark_sent(st: dict, picks: list[dict], now: float | None = None, attrib: dict | None = None) -> None:
     """보낸 알림을 상태에 남긴다. 쿨다운·일일예산과 함께, 재알림 판정에 쓸
     '오늘 몇 번, 마지막에 몇 % 에서 알렸나' 를 기록한다."""
     now = now or time.time()
@@ -1374,8 +1504,13 @@ def mark_sent(st: dict, picks: list[dict], now: float | None = None) -> None:
         st["sent"][p["ticker"]] = now
         st.setdefault("log", []).append(now)
         s = seen.get(p["ticker"]) or {}
+        a = (attrib or {}).get(p["ticker"]) or s.get("attrib")
         seen[p["ticker"]] = {"n": int(s.get("n") or 0) + 1,
                              "pct": _num(p.get("pct")), "t": now}
+        if a and a.get("cause"):
+            # 같은 날 재알림 때 원인을 다시 찾지 않도록 남겨 둔다 (Claude 호출 절약)
+            seen[p["ticker"]]["attrib"] = {k: a.get(k) for k in ("ticker", "cause", "context",
+                                                                   "confidence", "sources")}
 
 
 def scan_once(market: str, st: dict, universe: str,
@@ -1403,7 +1538,14 @@ def scan_once(market: str, st: dict, universe: str,
     detail = "" if CFG["QUIET_LOG"] else ": " + ", ".join(
         f"{p['ticker']}({p['pct']:+.1f}%,{p.get('trigger','')})" for p in picks)
     log(f"스냅샷 {len(rows)}종목 → 알림 {len(picks)}{detail}")
-    attrib = attribute(picks, market)
+    # 오늘 이미 알린 종목은 그때 찾은 원인을 다시 쓴다 (같은 날 재알림에 Claude 를 또 부르지 않음)
+    seen = st.get("seen", {})
+    reuse = {p["ticker"]: seen[p["ticker"]]["attrib"] for p in picks
+             if (seen.get(p["ticker"]) or {}).get("attrib")}
+    attrib = attribute([p for p in picks if p["ticker"] not in reuse], market)
+    attrib.update(reuse)
+    if reuse:
+        log(f"귀인 재사용 {len(reuse)}건 (같은 날 재알림)")
     log_signals(picks, attrib, market)
     # 버튼을 붙이다 실패하더라도 알림 자체는 반드시 나가야 한다.
     # 반자동은 부가 기능이고, 급변을 알려 주는 것이 이 시스템의 본래 일이다.
@@ -1420,7 +1562,7 @@ def scan_once(market: str, st: dict, universe: str,
                 f"{type(e).__name__} {str(e)[:100]}")
             markup = ""
     send(picks, attrib, market, markup)
-    mark_sent(st, picks)
+    mark_sent(st, picks, attrib=attrib)
     save_state(market, st)
     return len(picks), len(rows)
 

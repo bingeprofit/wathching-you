@@ -103,6 +103,10 @@ jobs:
           MIN_TURNOVER_USD: "1e7"    # 일환산 거래대금 $10M 미만 제외
           MAX_SD_PCT_US:    "12"     # 최근 20일 일간 σ 12% 초과 제외 (복권형)
           DD_MAX_PCT:       "60"     # 100거래일 최고 종가 대비 -60% 이하 제외
+          # 보통주만 (ETF·ETN·레버리지·워런트·유닛·우선주 제외, SPAC 은 포함) — 2026-10-12
+          US_COMMON_ONLY:   "1"
+          MIN_MCAP_USD:     "3e8"    # 시총 $300M 미만 제외 (SPAC 은 면제). 0=끔
+          SEARCH_PER_NAME:  "1"      # 원인 찾기 웹검색 종목당 1회 (2→1)
           # ── 관심종목(US_WATCHLIST 또는 기본 목록) 은 문턱을 낮춰 따로 ──
           # |등락| 2%↑ + 2σ↑, 거래량 무관, SPY 대비 초과 2%p↑. 한 번에 2개까지.
           CORE_MIN_ABS_PCT:  "2.0"
@@ -175,6 +179,10 @@ jobs:
           MIN_TURNOVER_USD: "1e7"    # 일환산 거래대금 $10M 미만 제외
           MAX_SD_PCT_US:    "12"     # 최근 20일 일간 σ 12% 초과 제외 (복권형)
           DD_MAX_PCT:       "60"     # 100거래일 최고 종가 대비 -60% 이하 제외
+          # 보통주만 (ETF·ETN·레버리지·워런트·유닛·우선주 제외, SPAC 은 포함) — 2026-10-12
+          US_COMMON_ONLY:   "1"
+          MIN_MCAP_USD:     "3e8"    # 시총 $300M 미만 제외 (SPAC 은 면제). 0=끔
+          SEARCH_PER_NAME:  "1"      # 원인 찾기 웹검색 종목당 1회 (2→1)
           # ── 관심종목(US_WATCHLIST 또는 기본 목록) 은 문턱을 낮춰 따로 ──
           # |등락| 2%↑ + 2σ↑, 거래량 무관, SPY 대비 초과 2%p↑. 한 번에 2개까지.
           CORE_MIN_ABS_PCT:  "2.0"
