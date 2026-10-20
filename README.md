@@ -640,6 +640,8 @@ python monitor.py --market fut --force \
 | `FUT_ROLL_DAYS` | 4 | 잔존일수가 이보다 적으면 다음 월물로 |
 | `QUIET_LOG` | 0 | 1이면 로그에 종목명을 남기지 않음 |
 | `PAPER_TRADING` | 0 | 1이면 알림에 모의투자 승인 버튼을 붙임 (한국장만) |
+| `PAPER_UP_ONLY` | 1 | 매수 버튼을 상승 급변 종목에만 붙임 (2026-10-20). 0 이면 급락 종목에도 |
+| `REVIEW_UP_ONLY` | 1 | 신호 성과 집계(익절 표·장기 추적·유형별)를 상승 급변 기준으로. 급락 알림은 맨 끝 '반등 매수 가정' 참고 블록만 |
 | `PAPER_ORDER_KRW` | 10,000,000 | 승인 1건당 주문금액(원) |
 | `APPROVE_TTL_MIN` | 15 | 승인 버튼 유효시간(분) |
 | `HOLD_DAYS` | 5 | 시간청산 — T+N 영업일 |

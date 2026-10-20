@@ -338,13 +338,20 @@ def long_track(rows: list[dict]) -> list[str]:
 def summarize(rows: list[dict]) -> str:
     void = [r for r in rows if r.get("void")]
     rows = [r for r in rows if not r.get("void")]
+    # 성과 집계의 본체는 상승 급변(추종 매수) — 2026-10-20 사용자 결정. 급락 알림은 알림으로는
+    # 계속 나가지만 '반등 매수' 가정 성과는 맨 끝 참고 블록으로만 본다.
+    if os.environ.get("REVIEW_UP_ONLY", "1") == "1":
+        dn_rows = [r for r in rows if (r.get("pct") or 0) < 0]
+        rows = [r for r in rows if (r.get("pct") or 0) > 0]
+    else:
+        dn_rows = []
     # 아래 익절 표가 'rows' 라는 이름을 다른 용도로 다시 쓰므로 미리 만들어 둔다
     lt = long_track(rows)
     done = [r for r in rows if r.get("r_t5") is not None]
     lab = _label(rows)
-    out = [f"📊 *신호 집계{' · ' + lab if lab else ''}* — 누적 알림 {len(rows)}건, "
-           f"수익률 확정 {len(done)}건",
-           f"_T+5 영업일 종가 기준, 비용 {COST:.2f}% 차감 전 원수익률_", ""]
+    out = [f"📊 *신호 집계{' · ' + lab if lab else ''}* — 상승 급변 {len(rows)}건, "
+           f"수익률 확정 {len(done)}건" + (f" (급락 {len(dn_rows)}건은 맨 끝 참고)" if dn_rows else ""),
+           f"_알림가 매수 가정 · T+5 영업일 종가 기준, 비용 {COST:.2f}% 차감 전 원수익률_", ""]
     out += pipeline(rows)
     if void:
         ds = sorted({str(r.get("date")) for r in void})
@@ -370,9 +377,10 @@ def summarize(rows: list[dict]) -> str:
 
     cut("전체", lambda r: True)
     out.append("")
-    cut("급등 알림 (추종 시 수익)", lambda r: (r.get("pct") or 0) > 0)
-    cut("급락 알림 (반등 베팅 시 수익)", lambda r: (r.get("pct") or 0) < 0)
-    out.append("")
+    if not dn_rows:
+        cut("급등 알림 (추종 시 수익)", lambda r: (r.get("pct") or 0) > 0)
+        cut("급락 알림 (반등 베팅 시 수익)", lambda r: (r.get("pct") or 0) < 0)
+        out.append("")
     cut("순간급변 경로", lambda r: "순간" in str(r.get("trigger") or ""))
     cut("누적 경로만", lambda r: str(r.get("trigger") or "") == "누적")
     # 관심종목은 낮은 문턱으로 걸린 대형주다. 소형주 급등과 성과가 다를 것이라
@@ -454,6 +462,17 @@ def summarize(rows: list[dict]) -> str:
             byr.setdefault(c.get("exit_reason") or "?", []).append(c["ret_pct"])
         for k, v in sorted(byr.items()):
             out.append(f"  {k}: {_stat(v)}")
+    # 급락 알림 — 반등 매수 가정 성과 (참고)
+    dn_done = [r for r in dn_rows if r.get("r_t5") is not None or r.get("r_t1") is not None]
+    if dn_rows:
+        out += ["", "─" * 28, f"*참고 — 급락 알림 {len(dn_rows)}건 (반등 매수 가정)*"]
+        if dn_done:
+            out.append(f"  T+1  {_stat([r.get('r_t1') for r in dn_done if r.get('r_t1') is not None])}")
+            v5 = [r.get("r_t5") for r in dn_done if r.get("r_t5") is not None]
+            if v5:
+                out.append(f"  T+5  {_stat(v5)}")
+        else:
+            out.append("  아직 확정된 수익률이 없습니다.")
     return "\n".join(out)
 
 

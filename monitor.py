@@ -132,6 +132,7 @@ CFG = {
     # PAPER_TRADING=1 이고 --market kr 일 때만 버튼이 붙는다. 미국은 자는
     # 시간이라 승인이 불가능하므로 전수 로깅만 한다.
     "PAPER":            env("PAPER_TRADING", "0") == "1",
+    "PAPER_UP_ONLY":    env("PAPER_UP_ONLY", "1") == "1",   # 매수 버튼을 상승 급변에만
     "PAPER_ORDER_KRW":  int(env("PAPER_ORDER_KRW", "10000000")),
     "APPROVE_TTL_MIN":  int(env("APPROVE_TTL_MIN", "15")),
     "HOLD_DAYS":        int(env("HOLD_DAYS", "5")),      # 시간청산: T+N 영업일
@@ -1596,7 +1597,11 @@ def scan_once(market: str, st: dict, universe: str,
             pk, bk = paper_ctx()
             P = _paper_mod()
             if pk and P is not None:
-                markup = P.keyboard(picks, P.offer(bk, picks, market))
+                # 매수 버튼은 상승 급변에만 (2026-10-20). 급락 '반등 매수' 는 이력상
+                # 한국 T+5 평균 −8.5% 로 성과가 나빴고, 검증 대상도 상승 추종으로 좁힌다.
+                buy = [p for p in picks if float(p.get("pct") or 0) > 0] if CFG["PAPER_UP_ONLY"] else picks
+                if buy:
+                    markup = P.keyboard(buy, P.offer(bk, buy, market))
                 P.save_book(STATE_DIR, bk, log)
         except Exception as e:
             log(f"승인 버튼 생성 실패(알림은 그대로 발송): "
