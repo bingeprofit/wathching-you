@@ -1359,6 +1359,8 @@ def log_signals(picks: list[dict], attrib: dict, market: str) -> None:
                     "prev_close": _num(r.get("prev_close")), "hi_long": _num(r.get("hi_long")),
                     "cause": a.get("cause"),
                     "confidence": a.get("confidence"),
+                    "mcap": _num(r.get("mcap")), "q": r.get("q"), "q_hit": r.get("q_hit"),
+                    "lc_oversold": bool(r.get("lc_oversold")), "chase_warn": bool(r.get("chase_warn")),
                 }, ensure_ascii=False) + "\n")
     except Exception as e:
         log(f"신호 로깅 실패: {str(e)[:80]}")
@@ -1498,6 +1500,42 @@ def send(picks: list[dict], attrib: dict, market: str, markup: str = ""):
             log(f"텔레그램 실패: {str(e)[:80]}")
 
 
+# ── 신호 품질 태그 (2026-10-21, 9/21~10/12 이력 분석에서 나온 특징) ───────────────
+# 한국 상승: 중형주 · 거래량 3~30배 · 개장 30분 뒤 · 100일 고점 대비 -25% 이하 · 허가·승인류 원인 또는 원인 확실
+#            → 맞는 개수를 별점으로. 이력상 이 조건들 쪽 5영업일 승률이 52~58% (반대쪽 27~34%).
+# 미국 급락: 시총 $20억 이상 + 거래량 3배 미만 → '대형주 과매도' (이력상 반등 승률 59~65%).
+# 미국 상승: 시총 $20억 미만 → '종가 추격 주의' (종가까지 오름폭을 지킨 소형 급등주를 종가에 사면 T+5 승률 18%).
+_EVENT = re.compile(r"임상|허가|FDA|승인|신약|품목|CMS|EMA|식약처", re.I)
+
+
+def quality(r: dict, a: dict, market: str) -> dict:
+    out: dict = {}
+    pct = float(r.get("pct") or 0)
+    mi = mcap_info(market, r["ticker"]) if market in ("kr", "us") else None
+    mc = (mi or {}).get("mcap")
+    if mc:
+        out["mcap"] = mc
+    vr = r.get("vol_ratio")
+    vr = float(vr) if vr is not None and vr == vr else None
+    if market == "kr" and pct > 0:
+        mins = elapsed_frac(market) * SESSION_OF.get(market, 390)
+        pc, hi = prev_close_of(r), r.get("hi_long")
+        dd = (pc / hi - 1) if pc and hi else None
+        cause = str(a.get("cause") or "")
+        conds = [("중형주", bool(mc) and 1e11 <= mc <= 1e12),
+                 ("거래량 3~30배", vr is not None and 3 <= vr <= 30),
+                 ("개장 30분 뒤", mins >= 30),
+                 ("고점 대비 -25%↓", dd is not None and dd <= -0.25),
+                 ("허가·승인/원인 확실", bool(_EVENT.search(cause)) or str(a.get("confidence")) == "high")]
+        out["q"] = sum(1 for _, ok in conds if ok)
+        out["q_hit"] = [n for n, ok in conds if ok]
+    if market == "us" and pct < 0 and mc and mc >= 2e9 and (vr is None or vr < 3):
+        out["lc_oversold"] = True
+    if market == "us" and pct > 0 and (not mc or mc < 2e9) and not r.get("core"):
+        out["chase_warn"] = True
+    return out
+
+
 def render(picks: list[dict], attrib: dict, market: str) -> str:
     now = dt.datetime.now(KST if market == "kr" else ET)
     tz = "KST" if market == "kr" else "ET"
@@ -1519,6 +1557,13 @@ def render(picks: list[dict], attrib: dict, market: str) -> str:
         tg = f" `{r['trigger']}`" if r.get("trigger") else ""
         out.append(f"*{lab}*  {r['pct']:+.1f}%  ({' · '.join(bits)}){tg} "
                    f"{mark.get(str(a.get('confidence','')).lower(),'')}")
+        if r.get("q") is not None:
+            out.append(f"  품질 {'★' * r['q']}{'☆' * (5 - r['q'])}"
+                       + (f"  ({' · '.join(r.get('q_hit') or [])})" if r.get("q_hit") else ""))
+        if r.get("lc_oversold"):
+            out.append("  🟢 대형주 과매도 — 이력상 5일 반등 우세 (거래량 적은 일회성 급락)")
+        if r.get("chase_warn"):
+            out.append("  ⚠️ 소형 급등 — 종가까지 버텨도 종가 추격은 이력상 불리")
         if r.get("prev_alert_pct") is not None:
             out.append(f"  🔁 오늘 {r.get('alert_n') or 2}번째 — 직전 알림 "
                        f"{float(r['prev_alert_pct']):+.1f}% → 지금 {r['pct']:+.1f}%")
@@ -1588,6 +1633,11 @@ def scan_once(market: str, st: dict, universe: str,
     attrib.update(reuse)
     if reuse:
         log(f"귀인 재사용 {len(reuse)}건 (같은 날 재알림)")
+    for p in picks:
+        try:
+            p.update(quality(p, attrib.get(p["ticker"], {}), market))
+        except Exception as e:
+            log(f"품질 태그 실패 {p.get('ticker')}: {type(e).__name__}")
     log_signals(picks, attrib, market)
     # 버튼을 붙이다 실패하더라도 알림 자체는 반드시 나가야 한다.
     # 반자동은 부가 기능이고, 급변을 알려 주는 것이 이 시스템의 본래 일이다.

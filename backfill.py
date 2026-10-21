@@ -401,6 +401,24 @@ def summarize(rows: list[dict]) -> str:
     out.append("")
     cut("한국", lambda r: r.get("market") == "kr")
     cut("미국", lambda r: r.get("market") == "us")
+    # 품질 별점 (2026-10-21 도입 — 그 뒤 알림부터 붙는다)
+    if any(r.get("q") is not None for r in done):
+        out += ["", "*한국 상승 — 품질 별점별* (중형주·거래량 3~30배·개장 30분 뒤·고점 -25%↓·허가/원인 확실)"]
+        cut("  ★4~5", lambda r: r.get("market") == "kr" and (r.get("q") or 0) >= 4)
+        cut("  ★2~3", lambda r: r.get("market") == "kr" and r.get("q") in (2, 3))
+        cut("  ★0~1", lambda r: r.get("market") == "kr" and r.get("q") is not None and r["q"] <= 1)
+    # 미국 급등주 종가 추격: 종가가 알림가 이상으로 끝난 것을 '종가에' 샀다면
+    us_up = [r for r in done if r.get("market") == "us" and r.get("r_close") is not None]
+    if us_up:
+        def from_close(r):
+            return ((1 + r["r_t5"] / 100) / (1 + r["r_close"] / 100) - 1) * 100
+        held = [from_close(r) for r in us_up if r["r_close"] >= 0]
+        faded = [from_close(r) for r in us_up if r["r_close"] < 0]
+        out += ["", "*미국 상승 — 알림 당일 종가에 샀다면 T+5*"]
+        if held:
+            out.append(f"  종가까지 버팀  {_stat(held)}")
+        if faded:
+            out.append(f"  장중 밀림      {_stat(faded)}")
 
     # ── 익절 수준 비교 ─────────────────────────────────────────────────
     # 이 표가 "몇 %에서 익절할 것인가" 에 답한다. 손절선은 실제 운용과 같은
@@ -473,6 +491,13 @@ def summarize(rows: list[dict]) -> str:
                 out.append(f"  T+5  {_stat(v5)}")
         else:
             out.append("  아직 확정된 수익률이 없습니다.")
+        lc = [r for r in dn_done if r.get("lc_oversold")]
+        if lc:
+            out.append(f"  _미국 대형주 과매도 태그 {len(lc)}건_")
+            out.append(f"  T+1  {_stat([r.get('r_t1') for r in lc if r.get('r_t1') is not None])}")
+            v5 = [r.get("r_t5") for r in lc if r.get("r_t5") is not None]
+            if v5:
+                out.append(f"  T+5  {_stat(v5)}")
     return "\n".join(out)
 
 
