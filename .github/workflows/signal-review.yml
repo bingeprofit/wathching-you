@@ -139,6 +139,20 @@ jobs:
           cache: pip
       - run: pip install -r requirements.txt
 
+      # 한국·미국 비교 차트용: 방금 한국 잡이 채워 저장한 한국 기록을 state_kr 로 받아 둔다
+      # (캐시는 path 가 같아야 복원돼서 state 로 받은 뒤 이름을 바꾼다)
+      - name: 한국 기록 복원 (비교 차트용)
+        continue-on-error: true
+        uses: actions/cache/restore@v4
+        with:
+          path: state
+          key: intraday-kr-none-${{ github.run_id }}
+          restore-keys: intraday-kr-
+      - name: 한국 기록 옮기기
+        run: |
+          if [ -d state ]; then mv state state_kr; fi
+          (sudo apt-get update -qq && sudo apt-get install -y -qq fonts-nanum) >/dev/null 2>&1 || true
+
       # 장중 잡과 같은 path(state)·같은 접두어라야 복원된다. 채운 결과는 새 키로
       # 저장되고, 다음 장중 잡이 그걸(가장 최신) 이어받는다.
       - name: 상태 복원
@@ -173,3 +187,11 @@ jobs:
         run: |
           python backfill.py --send \
             ${{ github.event.inputs.attach == 'true' && '--attach' || '' }}
+
+      # 텔레그램 차트: 상승 급변 성과 한국 vs 미국 (승률 · T+5 분포 · 별점/시총 · 누적 평균)
+      - name: 한국·미국 비교 차트
+        continue-on-error: true
+        env:
+          TELEGRAM_TOKEN:   ${{ secrets.TELEGRAM_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: python review_chart.py --kr state_kr/signals.jsonl --us state/signals.jsonl --send
