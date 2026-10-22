@@ -752,7 +752,8 @@ def offer(bk: dict, picks: list[dict], market: str) -> int:
             "code": p["ticker"], "name": p.get("name") or p["ticker"],
             "px": float(p.get("last") or 0.0), "sd": float(p.get("sd_daily") or 0.0),
             "pct": float(p.get("pct") or 0.0), "trigger": p.get("trigger") or "",
-            "market": market, "ts": ts}
+            "market": market, "ts": ts, "q": p.get("q"),
+            "mcap": p.get("mcap"), "vol_ratio": p.get("vol_ratio")}
     # 만료된 제안은 흘려보낸다 (버튼을 눌러도 만료 안내만 나간다).
     cut = ts - 6 * 3600
     for k in [k for k, v in bk["pending"].items() if v.get("ts", 0) < cut]:
@@ -853,7 +854,9 @@ def make_approver(pk: "PaperKIS", bk: dict, price_fn, cfg: dict, log=print,
             "sd": sd, "stop": stop, "stop_src": stop_src, "target": target,
             "trigger": pend.get("trigger") or "",
             "entry_pct": pend.get("pct"), "ord_no": o.get("ord_no", ""),
-            "delay_min": round(age, 1)}
+            "delay_min": round(age, 1), "q": pend.get("q"),
+            "mcap": pend.get("mcap"), "vol_ratio": pend.get("vol_ratio"),
+            "auto": chat == "auto"}
 
         nm = pend["name"]
         if f is None or filled <= 0:
@@ -869,9 +872,10 @@ def make_approver(pk: "PaperKIS", bk: dict, price_fn, cfg: dict, log=print,
         drop = f"{stop:,.0f}원" + (f"({stop_src})" if stop_src and stop_src != "σ" else "") \
             if stop else "미설정"
         goal = f"익절 {target:,.0f}원(+{tp:.1f}%) · " if target else ""
+        lag = "자동 주문" if chat == "auto" else f"승인지연 {age:.1f}분"
         return (f"{head}\n"
                 f"{goal}손절 {drop} · 시간청산 T+{cfg['HOLD_DAYS']}영업일 · "
-                f"승인지연 {age:.1f}분{shrink}")
+                f"{lag}{shrink}")
 
     return on_approve
 

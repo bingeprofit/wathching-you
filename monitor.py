@@ -133,6 +133,10 @@ CFG = {
     # 시간이라 승인이 불가능하므로 전수 로깅만 한다.
     "PAPER":            env("PAPER_TRADING", "0") == "1",
     "PAPER_UP_ONLY":    env("PAPER_UP_ONLY", "1") == "1",   # 매수 버튼을 상승 급변에만
+    # 자동 주문 (2026-10-23~): 버튼 승인 없이 알림과 동시에 모의계좌로 주문한다.
+    # 반자동은 회사 준법 사전승인 체계 때문이었는데 퇴사로 그 제약이 없어졌고,
+    # 승인 대기·누락 없이 상승 신호 전체의 표본을 쌓는 편이 검증에 낫다.
+    "PAPER_AUTO":       env("PAPER_AUTO", "0") == "1",
     "PAPER_ORDER_KRW":  int(env("PAPER_ORDER_KRW", "10000000")),
     "APPROVE_TTL_MIN":  int(env("APPROVE_TTL_MIN", "15")),
     "HOLD_DAYS":        int(env("HOLD_DAYS", "5")),      # 시간청산: T+N 영업일
@@ -1475,6 +1479,26 @@ def paper_pump(market: str) -> None:
     P.save_book(STATE_DIR, bk, log)
 
 
+def paper_auto(P, pk, bk: dict, buy: list[dict], market: str) -> list[str]:
+    """상승 급변 알림과 동시에 모의계좌로 바로 주문 (버튼 승인과 같은 검사를 그대로 거친다:
+    보유 중·보유 상한·상한가·현금·체결 확인). 결과 문장 목록을 돌려준다."""
+    api = kis_api()
+    price_fn = (lambda c: api.price(c)) if api else (lambda c: None)
+    bars_fn = (lambda c: api.daily(c, 40)) if api else None
+    approve = P.make_approver(pk, bk, price_fn, CFG, paper_log(bk), bars_fn=bars_fn)
+    buy = [p for p in buy if p["ticker"] not in (bk.get("positions") or {})]   # 재알림은 조용히 건너뜀
+    if not buy:
+        return []
+    ts = P.offer(bk, buy, market)
+    out = []
+    for p in buy:
+        try:
+            out.append(approve(f"b|{p['ticker']}|{ts}", "auto"))
+        except Exception as e:
+            log(f"자동주문 실패: {type(e).__name__} {str(e)[:100]}")
+    return out
+
+
 # ── 알림 ─────────────────────────────────────────────────────────────────
 def send(picks: list[dict], attrib: dict, market: str, markup: str = ""):
     tok, cid = env("TELEGRAM_TOKEN"), env("TELEGRAM_CHAT_ID")
@@ -1641,7 +1665,7 @@ def scan_once(market: str, st: dict, universe: str,
     log_signals(picks, attrib, market)
     # 버튼을 붙이다 실패하더라도 알림 자체는 반드시 나가야 한다.
     # 반자동은 부가 기능이고, 급변을 알려 주는 것이 이 시스템의 본래 일이다.
-    markup = ""
+    markup, auto_msgs = "", []
     if paper_on(market):
         try:
             pk, bk = paper_ctx()
@@ -1650,7 +1674,9 @@ def scan_once(market: str, st: dict, universe: str,
                 # 매수 버튼은 상승 급변에만 (2026-10-20). 급락 '반등 매수' 는 이력상
                 # 한국 T+5 평균 −8.5% 로 성과가 나빴고, 검증 대상도 상승 추종으로 좁힌다.
                 buy = [p for p in picks if float(p.get("pct") or 0) > 0] if CFG["PAPER_UP_ONLY"] else picks
-                if buy:
+                if buy and CFG["PAPER_AUTO"]:
+                    auto_msgs = paper_auto(P, pk, bk, buy, market)
+                elif buy:
                     markup = P.keyboard(buy, P.offer(bk, buy, market))
                 P.save_book(STATE_DIR, bk, log)
         except Exception as e:
@@ -1658,6 +1684,18 @@ def scan_once(market: str, st: dict, universe: str,
                 f"{type(e).__name__} {str(e)[:100]}")
             markup = ""
     send(picks, attrib, market, markup)
+    if auto_msgs:
+        tok, cid = env("TELEGRAM_TOKEN"), env("TELEGRAM_CHAT_ID")
+        if tok and cid:
+            txt = "🤖 *모의 자동주문*\n" + "\n\n".join(auto_msgs)
+            try:
+                r = requests.post(f"https://api.telegram.org/bot{tok}/sendMessage", timeout=30,
+                                  data={"chat_id": cid, "text": txt[:4000], "parse_mode": "Markdown"})
+                if not r.ok:
+                    requests.post(f"https://api.telegram.org/bot{tok}/sendMessage", timeout=30,
+                                  data={"chat_id": cid, "text": txt.replace("*", "")[:4000]})
+            except Exception as e:
+                log(f"자동주문 알림 실패: {type(e).__name__}")
     mark_sent(st, picks, attrib=attrib)
     save_state(market, st)
     return len(picks), len(rows)

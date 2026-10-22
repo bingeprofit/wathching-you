@@ -154,15 +154,16 @@ jobs:
           KIS_PAPER_APP_SECRET:   ${{ secrets.KIS_PAPER_APP_SECRET }}
           KIS_PAPER_ACCOUNT:      ${{ secrets.KIS_PAPER_ACCOUNT }}
           PAPER_TRADING:    "1"   # 0 으로 두면 알림·로깅만 하고 버튼은 안 붙는다
+          PAPER_AUTO:       "1"   # 1 = 상승 급변 알림과 동시에 자동 주문 (0 이면 버튼 승인)
           PAPER_ORDER_KRW:  "10000000"   # 건당 주문금액 (고정)
           APPROVE_TTL_MIN:  "15"  # 버튼 유효시간(분). 지나면 만료 안내만 회신
           HOLD_DAYS:        "5"   # 시간청산 — T+5 영업일
           STOP_SD:          "1.5" # 손절 — 진입가 -1.5×일간σ
           TAKE_PROFIT_PCT:  "5.0" # 익절 — 진입가 +5%. 0 이면 끔
           PRICE_LIMIT_PCT:  "29.5"# 상한가·하한가는 승인해도 주문하지 않음
-          # 동시 보유 상한. 30 × 1,000만원 = 3억(시드 5억의 60%). 그 위는
-          # 매수 직전 주문가능현금 확인이 막는다 (모자라면 가능한 만큼만 산다).
-          MAX_POSITIONS:    "30"
+          # 동시 보유 상한. 자동 주문으로 표본이 늘어 30 → 45 (× 1,000만원 = 4.5억, 시드 5억의 90%).
+          # 그 위는 매수 직전 주문가능현금 확인이 막는다 (모자라면 가능한 만큼만 산다).
+          MAX_POSITIONS:    "45"
           ROUND_TRIP_PCT:   "0.55"
           # 잔고에 있는데 장부에 없는 종목을 장부로 들여 손절·시간청산을 건다.
           ADOPT_ORPHANS:    "1"
