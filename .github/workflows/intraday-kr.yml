@@ -1,4 +1,5 @@
 name: 한국 장중 급변동 모니터
+run-name: ${{ inputs.slot && format('{0} ⏰[{1}]', github.workflow, inputs.slot) || github.workflow }}
 
 # 한국 정규장 09:00~15:30 KST = 00:00~06:30 UTC (한국은 서머타임 없음).
 #
@@ -31,6 +32,10 @@ on:
     - cron: "20 3 * * 1-5"      # 오후 예비
   workflow_dispatch:
     inputs:
+      slot:
+        description: "VM 정시 실행용 (runner/vmcron) — 수동 실행 때는 비워 두세요"
+        type: string
+        default: ""
       force:
         description: "장 시간을 무시하고 즉시 1회 스캔 (연결 테스트용)"
         type: boolean
@@ -57,11 +62,44 @@ on:
 # 수동 루프와 늦게 뜬 예약 루프가 동시에 돌아 알림이 두 번 가고 모의투자 장부가
 # 서로 덮어써진다. force·paper_probe 같은 짧은 점검만 따로 돈다.
 concurrency:
-  group: intraday-kr-${{ (github.event_name == 'schedule' || (!inputs.force && !inputs.paper_probe)) && 'sched' || 'manual' }}
+  group: intraday-kr-${{ ((inputs.slot && 'schedule' || github.event_name) == 'schedule' || (!inputs.force && !inputs.paper_probe)) && 'sched' || 'manual' }}
   cancel-in-progress: false
 
 jobs:
+  # GitHub 예약 실행은 몇 시간씩 늦는 날이 있어 GCP VM 이 같은 시각에 정시 실행을 건다 (runner/vmcron).
+  # 이 예약(schedule) 실행은 백업 — VM 이 같은 슬롯을 이미 실행했으면 나머지 잡을 건너뛴다.
+  gate:
+    if: github.event_name == 'schedule'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 3
+    permissions:
+      actions: read
+    outputs:
+      skip: ${{ steps.g.outputs.skip }}
+    steps:
+      - id: g
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SLOT: ${{ github.event.schedule }}
+        run: |
+          wf=$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" --jq .workflow_id) || wf=""
+          since=$(date -u -d '-8 hours' +%Y-%m-%dT%H:%M:%SZ)
+          n=0
+          if [ -n "$wf" ]; then
+            n=$(gh api "repos/$GITHUB_REPOSITORY/actions/workflows/$wf/runs?event=workflow_dispatch&created=%3E%3D$since&per_page=100" \
+                  --jq "[.workflow_runs[] | select(.display_title | endswith(\"⏰[$SLOT]\"))] | length") || n=0
+          fi
+          echo "최근 8시간 VM 정시 실행 [$SLOT]: ${n:-0}건"
+          if [ "${n:-0}" -gt 0 ]; then
+            echo "skip=1" >> "$GITHUB_OUTPUT"
+            echo "::notice title=백업 예약 건너뜀::VM 이 이미 정시에 실행함 [$SLOT]"
+          else
+            echo "skip=0" >> "$GITHUB_OUTPUT"
+          fi
+
   watch:
+    needs: gate
+    if: ${{ !cancelled() && needs.gate.outputs.skip != '1' }}
     runs-on: ubuntu-24.04   # ubuntu-latest 는 10/19 부터 Ubuntu 26 — 고정
     timeout-minutes: 250
     steps:
@@ -86,7 +124,7 @@ jobs:
       - name: 구간 결정
         id: seg
         run: |
-          S="${{ github.event.schedule }}"
+          S="${{ (github.event.schedule || inputs.slot) }}"
           case "$S" in
             "45 23 * * 0-4"|"15 0 * * 1-5") U="12:00"; K="am" ;;
             "") # 수동 실행: 12:00 이하까지면 오전, 넘으면 오후 구간으로 센다
