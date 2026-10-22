@@ -505,11 +505,27 @@ def send_tg(text: str, attach: bool) -> None:
     tok, cid = os.environ.get("TELEGRAM_TOKEN", ""), os.environ.get("TELEGRAM_CHAT_ID", "")
     if not (tok and cid):
         print(text); return
-    try:
-        requests.post(f"https://api.telegram.org/bot{tok}/sendMessage", timeout=30,
-                      data={"chat_id": cid, "text": text[:3900], "parse_mode": "Markdown"})
-    except Exception as e:
-        log(f"텔레그램 전송 실패: {str(e)[:80]}")
+    # 텔레그램 한 메시지는 4,096자. 예전엔 3,900자에서 잘랐는데, 미국 집계가 길어지면서
+    # 굵게(*)·코드(`) 표시가 중간에 잘려 Markdown 해석 오류(HTTP 400)로 통째로 안 갔다.
+    # → 줄 단위로 나눠 보내고, 그래도 거절되면 서식 없이 다시 보낸다. (응답 내용은 로그에 안 남김)
+    chunks, cur = [], ""
+    for line in text.split("\n"):
+        if len(cur) + len(line) + 1 > 3500 and cur:
+            chunks.append(cur); cur = ""
+        cur += line + "\n"
+    if cur.strip():
+        chunks.append(cur)
+    for i, ch in enumerate(chunks, 1):
+        try:
+            r = requests.post(f"https://api.telegram.org/bot{tok}/sendMessage", timeout=30,
+                              data={"chat_id": cid, "text": ch, "parse_mode": "Markdown"})
+            if r.status_code != 200:
+                log(f"텔레그램 {i}/{len(chunks)} 서식 거절 HTTP {r.status_code} → 서식 없이 재전송")
+                r = requests.post(f"https://api.telegram.org/bot{tok}/sendMessage", timeout=30,
+                                  data={"chat_id": cid, "text": ch.replace("*", "").replace("`", "")})
+            log(f"텔레그램 {i}/{len(chunks)} HTTP {r.status_code} ({len(ch)}자)")
+        except Exception as e:
+            log(f"텔레그램 전송 실패: {str(e)[:80]}")
     # 원본은 공개 저장소에 커밋하거나 Actions 아티팩트로 올리면 관심종목이
     # 그대로 드러난다. 텔레그램 비공개 대화로 보내는 편이 안전하다.
     if attach and os.path.exists(SIG):

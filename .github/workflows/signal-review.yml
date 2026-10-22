@@ -29,6 +29,10 @@ on:
         description: "VM 정시 실행용 (runner/vmcron) — 수동 실행 때는 비워 두세요"
         type: string
         default: ""
+      only:
+        description: "한쪽만 집계 (kr / us, 비우면 둘 다)"
+        type: string
+        default: ""
       attach:
         description: "원본 jsonl 도 텔레그램에 첨부 (분석용)"
         type: boolean
@@ -72,7 +76,7 @@ jobs:
 
   review_kr:
     needs: gate
-    if: ${{ !cancelled() && needs.gate.outputs.skip != '1' }}
+    if: ${{ !cancelled() && needs.gate.outputs.skip != '1' && inputs.only != 'us' }}
     name: 한국 신호 집계
     runs-on: ubuntu-24.04   # ubuntu-latest 는 10/19 부터 Ubuntu 26 — 고정
     timeout-minutes: 20
@@ -124,7 +128,7 @@ jobs:
   review_us:
     name: 미국 신호 집계
     needs: [gate, review_kr]
-    if: ${{ always() && needs.gate.outputs.skip != '1' }}
+    if: ${{ always() && needs.gate.outputs.skip != '1' && inputs.only != 'kr' }}
     runs-on: ubuntu-24.04   # ubuntu-latest 는 10/19 부터 Ubuntu 26 — 고정
     timeout-minutes: 20
     steps:
