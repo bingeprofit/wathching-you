@@ -30,7 +30,7 @@ on:
         type: string
         default: ""
       only:
-        description: "한쪽만 집계 (kr / us, 비우면 둘 다)"
+        description: "한쪽만 집계 (kr / us / chart=비교 차트만, 비우면 둘 다)"
         type: string
         default: ""
       attach:
@@ -76,7 +76,7 @@ jobs:
 
   review_kr:
     needs: gate
-    if: ${{ !cancelled() && needs.gate.outputs.skip != '1' && inputs.only != 'us' }}
+    if: ${{ !cancelled() && needs.gate.outputs.skip != '1' && inputs.only != 'us' && inputs.only != 'chart' }}
     name: 한국 신호 집계
     runs-on: ubuntu-24.04   # ubuntu-latest 는 10/19 부터 Ubuntu 26 — 고정
     timeout-minutes: 20
@@ -171,6 +171,7 @@ jobs:
           fi
 
       - name: 수익률 채우고 집계
+        if: inputs.only != 'chart'
         env:
           TELEGRAM_TOKEN:   ${{ secrets.TELEGRAM_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
@@ -194,4 +195,7 @@ jobs:
         env:
           TELEGRAM_TOKEN:   ${{ secrets.TELEGRAM_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-        run: python review_chart.py --kr state_kr/signals.jsonl --us state/signals.jsonl --send
+        run: |
+          pip install -q matplotlib
+          python review_chart.py --kr state_kr/signals.jsonl --us state/signals.jsonl --send \
+            || { echo "::warning title=비교 차트 실패::review_chart.py 오류 — 텍스트 집계는 정상 발송"; exit 1; }

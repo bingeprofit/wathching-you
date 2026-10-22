@@ -195,6 +195,8 @@ def send(path: str, cap: str) -> None:
         r = requests.post(f"https://api.telegram.org/bot{tok}/sendPhoto", timeout=60,
                           data={"chat_id": cid, "caption": cap[:1000]}, files={"photo": f})
     print(f"비교 차트 전송 HTTP {r.status_code}")
+    if r.status_code != 200:
+        raise SystemExit(f"텔레그램 거절 HTTP {r.status_code}")
 
 
 def main() -> int:
