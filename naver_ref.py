@@ -128,3 +128,40 @@ def kr_headlines(code: str, hours: int = 24) -> tuple[bool, list[str]]:
             if now - t <= dt.timedelta(hours=max(hours, 48)):     # 공시 시각대가 KST/UTC 모호 → 넉넉히
                 out.append(f"[공시 {t:%m/%d %H:%M}] {it.get('title')}")
     return got, out[:20]
+
+
+_PROFILE: dict = {}
+
+
+def kr_profile(code: str) -> dict:
+    """업종(WICS)과 사업 요약 한두 문장 — 와이즈리포트 기업현황(네이버 증권 '기업정보' 탭과 같은 출처).
+    기사가 없어 Claude 귀인을 건너뛴 종목에도 '무슨 회사인지' 를 붙이려고 쓴다. 실패하면 {}."""
+    if code in _PROFILE:
+        return _PROFILE[code]
+    out: dict = {}
+    try:
+        r = requests.get(f"https://navercomp.wisereport.co.kr/v2/company/c1010001.aspx?cmp_cd={code}",
+                         headers={"User-Agent": UA["User-Agent"]}, timeout=15)
+        if r.status_code == 200:
+            t = re.sub(r"<script.*?</script>", " ", r.text, flags=re.S)
+            t = re.sub(r"<[^>]+>", " ", t).replace("&nbsp;", " ")
+            t = re.sub(r"\s+", " ", t)
+            m = re.search(r"WICS\s*:\s*(.+?)\s+(?:EPS|BPS|PER)\b", t)
+            if m:
+                out["wics"] = m.group(1).strip()
+            i = t.find("동사는")
+            if i >= 0:
+                body = t[i:]
+                j = body.find("펀더멘털")
+                body = body[:j if j > 0 else 600].strip()
+                sents = [x.strip() for x in re.split(r"(?<=[음함임됨])\.\s*", body) if x.strip()]
+                summ = ""
+                for x in sents:                          # 앞에서부터 160자 안쪽으로
+                    if summ and len(summ) + len(x) > 160:
+                        break
+                    summ += x + ". "
+                out["summary"] = re.sub(r"^동사는\s*", "", summ.strip())
+    except Exception:
+        pass
+    _PROFILE[code] = out
+    return out

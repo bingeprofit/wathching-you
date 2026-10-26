@@ -1178,6 +1178,18 @@ def attribute(picks: list[dict], market: str) -> dict:
         out.update(_attribute_web(web, market))
     log(f"귀인(한국): 기사 있음 {len(with_news)} · 기사 없음 {sum(1 for v in out.values() if '기사·공시 없음' in str(v.get('cause')))}"
         f" · 웹검색 {len(web)}")
+    # 회사 설명(↳)이 비면 — 기사가 없어 Claude 를 부르지 않은 종목, 신규상장 등 — 와이즈리포트 업종·사업 요약으로 채운다
+    for r in picks:
+        a = out.setdefault(r["ticker"], {"ticker": r["ticker"]})
+        if a.get("context"):
+            continue
+        try:
+            pf = NR.kr_profile(r["ticker"])
+        except Exception:
+            pf = {}
+        if pf.get("summary") or pf.get("wics"):
+            a["context"] = " · ".join(x for x in (f"[{pf['wics']}]" if pf.get("wics") else "",
+                                                   pf.get("summary") or "") if x)
     return out
 
 
