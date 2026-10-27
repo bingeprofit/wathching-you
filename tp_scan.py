@@ -61,13 +61,16 @@ def paths(rows: list[dict], api, market: str) -> list[tuple[dict, list[dict]]]:
     return out
 
 
-def scan(pp: list[tuple[dict, list[dict]]], market: str, stop: bool = True) -> list[dict]:
+STOPS = [1.0, 1.5, 2.0, 3.0, 0.0]          # 손절 = 진입가 -k×일간σ (0 = 손절 없음)
+
+
+def scan(pp: list[tuple[dict, list[dict]]], market: str, stop: bool = True, k: float = STOP_SD) -> list[dict]:
     res = []
     for tp in GRID:
         v, hit = [], 0
         for r, after in pp:
             sd = float(r.get("sd_daily") or 0)
-            sl = STOP_SD * sd * 100 if (stop and sd > 0) else 0.0
+            sl = k * sd * 100 if (stop and k > 0 and sd > 0) else 0.0
             o = sim_exit(float(r["px"]), after, tp, sl, HOLD)
             if not o:
                 continue
@@ -124,6 +127,48 @@ def chart(series: dict, out: str) -> str:
     return out
 
 
+def heat(grids: dict, out: str) -> str:
+    """시장별 (손절 × 익절) 평균 수익률 표. 현재 규칙(익절 +5% · 손절 1.5σ)은 테두리, 최고 칸은 ★."""
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    from matplotlib.colors import TwoSlopeNorm
+    names = list(grids)
+    fig, axs = plt.subplots(len(names), 1, figsize=(12.5, 2.3 + 2.1 * len(names)))
+    axs = axs if len(names) > 1 else [axs]
+    lab = ["없음" if g == 0 else f"+{g}%" for g in GRID]
+    for ax, nm in zip(axs, names):
+        M, n = grids[nm]
+        vals = [v for row in M for v in row if v is not None]
+        if not vals:
+            continue
+        lim = max(abs(min(vals)), abs(max(vals)), 0.5)
+        Z = [[(v if v is not None else 0) for v in row] for row in M]
+        ax.imshow(Z, cmap="RdBu_r", norm=TwoSlopeNorm(0, -lim, lim), aspect="auto")
+        bi, bj = max(((i, j) for i in range(len(M)) for j in range(len(GRID)) if M[i][j] is not None),
+                     key=lambda ij: M[ij[0]][ij[1]])
+        for i in range(len(M)):
+            for j in range(len(GRID)):
+                v = M[i][j]
+                if v is None:
+                    continue
+                ax.text(j, i, ("★" if (i, j) == (bi, bj) else "") + f"{v:+.1f}", ha="center", va="center",
+                        fontsize=8, color="white" if abs(v) > lim * 0.55 else "#0b0b0b",
+                        fontweight="bold" if (i, j) == (bi, bj) else "normal")
+        ci, cj = STOPS.index(1.5), GRID.index(5)
+        ax.add_patch(plt.Rectangle((cj - 0.5, ci - 0.5), 1, 1, fill=False, ec="#0b0b0b", lw=2))
+        ax.set_xticks(range(len(GRID)), lab, fontsize=8.5)
+        ax.set_yticks(range(len(STOPS)), [("손절 없음" if k == 0 else f"손절 -{k:g}σ") for k in STOPS], fontsize=8.5)
+        ax.grid(False)
+        ax.set_title(f"{nm} (n={n}) — 평균 수익률 %, 비용 차감 · ★ 최고 · 굵은 테두리 = 지금 규칙(+5% · -1.5σ)",
+                     loc="left", fontsize=10, fontweight="bold")
+    axs[-1].set_xlabel("익절 수준 (진입가 대비, 다음 날부터 고가로 판정) · 시간청산 T+5")
+    fig.tight_layout()
+    fig.savefig(out, dpi=130)
+    plt.close(fig)
+    return out
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--kr", default="state_kr/signals.jsonl")
@@ -133,10 +178,11 @@ def main() -> int:
     from kis import KIS
     api = KIS(os.environ["KIS_APP_KEY"], os.environ["KIS_APP_SECRET"],
               state_dir=os.path.dirname(a.kr) or "state", log=lambda *x: None)
-    series, notes = {}, []
+    series, notes, PP = {}, [], {}
     for mk, path, c in (("kr", a.kr, "#eb6834"), ("us", a.us, "#2a78d6")):
         rows = load(path)
         pp = paths(rows, api, mk)
+        PP[mk] = pp
         name = {"kr": "한국", "us": "미국"}[mk]
         res = scan(pp, mk)
         series[name] = (res, c, "-")
@@ -158,6 +204,21 @@ def main() -> int:
                          f"{'익절 없음' if best['tp'] == 0 else '+%g%%' % best['tp']} → 평균 {best['mean']:+.2f}% · "
                          f"승률 {best['win']:.0f}% · 익절 도달 {best['hit']:.0f}%")
     out = chart(series, "tp_scan.png")
+    grids = {}
+    for mk, nm in (("kr", "한국 상승 급변"), ("us", "미국 상승 급변")):
+        pp = PP.get(mk) or []
+        if not pp:
+            continue
+        M = []
+        for k in STOPS:
+            res = {x["tp"]: x for x in scan(pp, mk, True, k)}
+            M.append([res[g]["mean"] if g in res else None for g in GRID])
+            if res:
+                b = max(res.values(), key=lambda x: x["mean"])
+                print(f"::notice title={nm} 손절 {k:g}σ::최고 익절 {b['tp']}% 평균 {b['mean']:+.2f}% 승률 {b['win']:.0f}% "
+                      f"(n={b['n']}) · +5% {res[5]['mean']:+.2f}%/{res[5]['win']:.0f}%", flush=True)
+        grids[nm] = (M, len(pp))
+    hp = heat(grids, "tp_heat.png") if grids else None
     if a.send and os.environ.get("TELEGRAM_TOKEN"):
         import requests
         with open(out, "rb") as f:
@@ -165,6 +226,11 @@ def main() -> int:
                               data={"chat_id": os.environ["TELEGRAM_CHAT_ID"],
                                     "caption": "📐 익절 수준 스캔\n" + "\n".join(notes)}, files={"photo": f})
         print(f"전송 HTTP {r.status_code}")
+        if hp:
+            with open(hp, "rb") as f:
+                requests.post(f"https://api.telegram.org/bot{os.environ['TELEGRAM_TOKEN']}/sendPhoto", timeout=60,
+                              data={"chat_id": os.environ["TELEGRAM_CHAT_ID"],
+                                    "caption": "📐 손절 × 익절 조합별 평균 수익률 (비용 차감)"}, files={"photo": f})
     return 0
 
 
