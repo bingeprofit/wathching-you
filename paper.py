@@ -37,7 +37,19 @@ _SESSION = requests.Session()
 _REAL = {"get": requests.get, "post": requests.post}
 
 
+# 모의투자 서버는 유량 한도가 아주 낮다 (초당 2건 수준). 자동 주문은 한 알림 묶음에서
+# 현금조회 → 해시키 → 주문 → 체결조회를 종목마다 연달아 부르니 EGW00201(초당 거래건수 초과)이
+# 났다 (10/27 삼성SDI·엑시콘·원텍). 모의 도메인 호출 사이에 최소 간격을 둔다.
+PAPER_MIN_GAP = float(os.environ.get("PAPER_MIN_GAP", "0.6"))
+_LAST = {"t": 0.0}
+
+
 def http(method: str, url: str, **kw):
+    if url.startswith(PAPER_BASE) and PAPER_MIN_GAP > 0:
+        wait = _LAST["t"] + PAPER_MIN_GAP - time.time()
+        if wait > 0:
+            time.sleep(wait)
+        _LAST["t"] = time.time()
     fn = getattr(requests, method)
     if fn is _REAL.get(method):
         fn = getattr(_SESSION, method)
@@ -288,7 +300,7 @@ class PaperKIS:
     # ── 주문 ────────────────────────────────────────────────────────────
     def order(self, code: str, qty: int, side: str = "buy",
               ord_dvsn: str = "01", price: int = 0,
-              _retry: bool = False) -> dict | None:
+              _retry: bool = False, _throttle: int = 0) -> dict | None:
         """국내주식 주문. side 는 buy/sell, ord_dvsn 01=시장가 00=지정가.
         성공하면 {"ord_no", "krx_fwdg_ord_orgno", "ord_tmd"}, 실패하면 None."""
         if qty < 1:
@@ -337,6 +349,11 @@ class PaperKIS:
             if str(j.get("msg_cd") or "") in TOKEN_DEAD and not _retry:
                 self._clear_token()
                 return self.order(code, qty, side, ord_dvsn, price, _retry=True)
+            # 유량 초과는 서버가 주문을 받지 않은 것 — 다시 보내도 중복 매수가 아니다
+            if str(j.get("msg_cd") or "") == "EGW00201" and _throttle < 3:
+                time.sleep(1.0 + _throttle)
+                return self.order(code, qty, side, ord_dvsn, price, _retry=_retry,
+                                  _throttle=_throttle + 1)
             self.last_err = self._fail(f"주문({side})", r, j)
             return None
         o = j.get("output") or {}
