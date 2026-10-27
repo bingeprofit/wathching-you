@@ -30,7 +30,7 @@ on:
         type: string
         default: ""
       only:
-        description: "한쪽만 집계 (kr / us / chart=비교 차트만, 비우면 둘 다)"
+        description: "한쪽만 집계 (kr / us / chart=비교 차트만 / tp=익절 수준 스캔, 비우면 둘 다)"
         type: string
         default: ""
       attach:
@@ -76,7 +76,7 @@ jobs:
 
   review_kr:
     needs: gate
-    if: ${{ !cancelled() && needs.gate.outputs.skip != '1' && inputs.only != 'us' && inputs.only != 'chart' }}
+    if: ${{ !cancelled() && needs.gate.outputs.skip != '1' && inputs.only != 'us' && inputs.only != 'chart' && inputs.only != 'tp' }}
     name: 한국 신호 집계
     runs-on: ubuntu-24.04   # ubuntu-latest 는 10/19 부터 Ubuntu 26 — 고정
     timeout-minutes: 20
@@ -128,7 +128,7 @@ jobs:
   review_us:
     name: 미국 신호 집계
     needs: [gate, review_kr]
-    if: ${{ always() && needs.gate.outputs.skip != '1' && inputs.only != 'kr' }}
+    if: ${{ always() && needs.gate.outputs.skip != '1' && inputs.only != 'kr' && inputs.only != 'tp' }}
     runs-on: ubuntu-24.04   # ubuntu-latest 는 10/19 부터 Ubuntu 26 — 고정
     timeout-minutes: 20
     steps:
@@ -199,3 +199,37 @@ jobs:
           pip install -q matplotlib
           python review_chart.py --kr state_kr/signals.jsonl --us state/signals.jsonl --send \
             || { echo "::warning title=비교 차트 실패::review_chart.py 오류 — 텍스트 집계는 정상 발송"; exit 1; }
+
+  # 수동 실행 only=tp: 익절 수준 스캔 (0·2·3·4·5·6·7·8·10·12·15·20·25·30%) — 한국·미국 상승 급변, 텔레그램 차트
+  tp_scan:
+    name: 익절 수준 스캔
+    if: ${{ inputs.only == 'tp' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+      - run: |
+          pip install -q -r requirements.txt matplotlib
+          (sudo apt-get update -qq && sudo apt-get install -y -qq fonts-nanum) >/dev/null 2>&1 || true
+      - uses: actions/cache/restore@v4
+        with:
+          path: state
+          key: intraday-kr-none-${{ github.run_id }}
+          restore-keys: intraday-kr-
+      - run: if [ -d state ]; then mv state state_kr; fi
+      - uses: actions/cache/restore@v4
+        with:
+          path: state
+          key: intraday-us-none-${{ github.run_id }}
+          restore-keys: intraday-us-
+      - name: 스캔
+        env:
+          TELEGRAM_TOKEN:   ${{ secrets.TELEGRAM_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          KIS_APP_KEY:      ${{ secrets.KIS_APP_KEY }}
+          KIS_APP_SECRET:   ${{ secrets.KIS_APP_SECRET }}
+        run: python tp_scan.py --kr state_kr/signals.jsonl --us state/signals.jsonl --send
