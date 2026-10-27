@@ -61,7 +61,8 @@ def paths(rows: list[dict], api, market: str) -> list[tuple[dict, list[dict]]]:
     return out
 
 
-STOPS = [1.0, 1.5, 2.0, 3.0, 0.0]          # 손절 = 진입가 -k×일간σ (0 = 손절 없음)
+STOPS = [1.0, 1.5, 2.0, 3.0, 0.0]
+SDMED: dict = {}                           # 시장별 일간σ 중앙값(%) — 'σ 몇 배' 가 몇 % 인지 보여 주려고          # 손절 = 진입가 -k×일간σ (0 = 손절 없음)
 
 
 def scan(pp: list[tuple[dict, list[dict]]], market: str, stop: bool = True, k: float = STOP_SD) -> list[dict]:
@@ -127,6 +128,87 @@ def chart(series: dict, out: str) -> str:
     return out
 
 
+RULES = [("이전 +5% · -1.5σ", 5, 1.5), ("지금 +15% · -1.5σ", 15, 1.5), ("+15% · -1σ", 15, 1.0),
+         ("+15% · -2σ", 15, 2.0), ("+15% · -3σ", 15, 3.0), ("+15% · 손절 없음", 15, 0.0)]
+
+
+def one(pp, market: str, tp: float, k: float) -> dict | None:
+    r = {x["tp"]: x for x in scan(pp, market, True, k)}
+    return r.get(tp)
+
+
+def paper_actual(book_path: str) -> dict:
+    """모의계좌 실제 청산 — 진입 때 익절선(target/entry)으로 규칙을 나눈다."""
+    out: dict = {}
+    try:
+        bk = json.load(open(book_path))
+    except Exception:
+        return out
+    for c in bk.get("closed") or []:
+        e, t, net = float(c.get("entry") or 0), float(c.get("target") or 0), c.get("ret_net_pct")
+        if not e or net is None:
+            continue
+        lab = f"+{round((t / e - 1) * 100):g}%" if t else "익절 없음"
+        out.setdefault(lab, []).append(float(net))
+    return out
+
+
+def rules_chart(pp_by: dict, paper: dict, out: str) -> tuple[str, str]:
+    import matplotlib.pyplot as plt
+    fig, axs = plt.subplots(1, 3, figsize=(14.5, 5.2), gridspec_kw={"width_ratios": [1, 1, 0.8]})
+    cap = []
+    for ax, (mk, nm, c) in zip(axs, (("kr", "한국", "#eb6834"), ("us", "미국", "#2a78d6"))):
+        pp = pp_by.get(mk) or []
+        ys, labs = [], []
+        for i, (lab, tp, k) in enumerate(RULES):
+            x = one(pp, mk, tp, k) if pp else None
+            labs.append(lab)
+            ys.append(x)
+        yy = list(range(len(RULES)))[::-1]
+        for y, x, (lab, tp, k) in zip(yy, ys, RULES):
+            if not x:
+                continue
+            col = c if lab.startswith("지금") else ("#b9b8b2" if lab.startswith("이전") else c)
+            ax.barh(y, x["mean"], 0.6, color=col, alpha=1.0 if lab.startswith(("지금", "이전")) else 0.45)
+            ax.text(max(x["mean"], 0) + 0.15, y, f"{x['mean']:+.2f}% · 승률 {x['win']:.0f}% · 익절 {x['hit']:.0f}%",
+                    va="center", fontsize=8.5, color="#52514e")
+        ax.axvline(0, color="#8a8984", lw=0.9)
+        ax.set_yticks(yy, labs, fontsize=9)
+        sdm = SDMED.get(f"{nm} 상승 급변") or 0
+        ax.set_title(f"{nm} 상승 급변 (n={len(pp)}) · 1σ ≈ {sdm:.1f}%", loc="left", fontsize=11, fontweight="bold")
+        ax.set_xlabel("평균 수익률 (%, 비용 차감) · 알림 시각 가격 매수 가정")
+        lo = min([x["mean"] for x in ys if x] + [0]); hi = max([x["mean"] for x in ys if x] + [0])
+        ax.set_xlim(lo - 0.5, hi + (hi - lo) * 1.2 + 1.5)
+        o, n_ = ys[0], ys[1]
+        if o and n_:
+            cap.append(f"{nm}: 이전 +5% {o['mean']:+.2f}%(승률 {o['win']:.0f}%) → 지금 +15% {n_['mean']:+.2f}%(승률 {n_['win']:.0f}%)")
+    a3 = axs[2]
+    if paper:
+        items = sorted(paper.items(), key=lambda kv: float(kv[0].strip("+%")) if kv[0][0] == "+" else 999)
+        for i, (lab, v) in enumerate(items):
+            m = statistics.fmean(v)
+            a3.bar(i, m, 0.6, color="#eb6834" if lab == "+15%" else "#b9b8b2")
+            a3.text(i, m, f" {m:+.2f}% · 승률 {sum(x > 0 for x in v) / len(v) * 100:.0f}% · n={len(v)}",
+                    ha="center", va="bottom" if m >= 0 else "top", fontsize=8)
+        ms = [statistics.fmean(v) for _, v in items] + [0]
+        span = max(ms) - min(ms) or 1
+        a3.set_ylim(min(ms) - span * 0.35, max(ms) + span * 0.35)
+        a3.set_xticks(range(len(items)), [f"익절 {k}" for k, _ in items])
+        a3.tick_params(axis="x", pad=2)
+        a3.axhline(0, color="#8a8984", lw=0.9)
+        cap.append("모의계좌 실제 청산: " + " · ".join(f"익절 {k} {statistics.fmean(v):+.2f}%(n={len(v)})" for k, v in items))
+    else:
+        a3.text(0.5, 0.5, "청산된 모의 거래 없음", ha="center", va="center", transform=a3.transAxes, color="#8a8984")
+    a3.set_title("한국 모의계좌 실제 청산 (규칙별)", loc="left", fontsize=11, fontweight="bold")
+    a3.set_ylabel("평균 순수익률 (%)")
+    fig.suptitle("익절·손절 규칙 비교 — 이전(+5%) vs 지금(+15%) · 손절 폭별", x=0.01, ha="left",
+                 fontsize=12.5, fontweight="bold")
+    fig.tight_layout(rect=(0, 0, 1, 0.93))
+    fig.savefig(out, dpi=130)
+    plt.close(fig)
+    return out, "📐 익절·손절 규칙 비교\n" + "\n".join(cap)
+
+
 def heat(grids: dict, out: str) -> str:
     """시장별 (손절 × 익절) 평균 수익률 표. 현재 규칙(익절 +5% · 손절 1.5σ)은 테두리, 최고 칸은 ★."""
     import matplotlib
@@ -155,12 +237,16 @@ def heat(grids: dict, out: str) -> str:
                 ax.text(j, i, ("★" if (i, j) == (bi, bj) else "") + f"{v:+.1f}", ha="center", va="center",
                         fontsize=8, color="white" if abs(v) > lim * 0.55 else "#0b0b0b",
                         fontweight="bold" if (i, j) == (bi, bj) else "normal")
-        ci, cj = STOPS.index(1.5), GRID.index(5)
-        ax.add_patch(plt.Rectangle((cj - 0.5, ci - 0.5), 1, 1, fill=False, ec="#0b0b0b", lw=2))
+        ci = STOPS.index(1.5)
+        for g, ls in ((5, ":"), (15, "-")):        # 이전 규칙 +5% (점선) · 지금 규칙 +15% (실선)
+            cj = GRID.index(g)
+            ax.add_patch(plt.Rectangle((cj - 0.5, ci - 0.5), 1, 1, fill=False, ec="#0b0b0b", lw=2, ls=ls))
         ax.set_xticks(range(len(GRID)), lab, fontsize=8.5)
-        ax.set_yticks(range(len(STOPS)), [("손절 없음" if k == 0 else f"손절 -{k:g}σ") for k in STOPS], fontsize=8.5)
+        sdm = SDMED.get(nm) or 0
+        ax.set_yticks(range(len(STOPS)), [("손절 없음" if k == 0 else f"손절 -{k:g}σ (≈-{k * sdm:.1f}%)") for k in STOPS],
+                      fontsize=8.5)
         ax.grid(False)
-        ax.set_title(f"{nm} (n={n}) — 평균 수익률 %, 비용 차감 · ★ 최고 · 굵은 테두리 = 지금 규칙(+5% · -1.5σ)",
+        ax.set_title(f"{nm} (n={n}) — 평균 수익률 %, 비용 차감 · ★ 최고 · 실선 = 지금 규칙(+15% · -1.5σ) · 점선 = 이전(+5%)",
                      loc="left", fontsize=10, fontweight="bold")
     axs[-1].set_xlabel("익절 수준 (진입가 대비, 다음 날부터 고가로 판정) · 시간청산 T+5")
     fig.tight_layout()
@@ -174,6 +260,7 @@ def main() -> int:
     ap.add_argument("--kr", default="state_kr/signals.jsonl")
     ap.add_argument("--us", default="state/signals.jsonl")
     ap.add_argument("--send", action="store_true")
+    ap.add_argument("--daily", action="store_true", help="매일 집계용: 규칙 비교 + 히트맵만")
     a = ap.parse_args()
     from kis import KIS
     api = KIS(os.environ["KIS_APP_KEY"], os.environ["KIS_APP_SECRET"],
@@ -183,6 +270,8 @@ def main() -> int:
         rows = load(path)
         pp = paths(rows, api, mk)
         PP[mk] = pp
+        sds = [float(r.get("sd_daily") or 0) * 100 for r, _ in pp if r.get("sd_daily")]
+        SDMED[{"kr": "한국", "us": "미국"}[mk] + " 상승 급변"] = statistics.median(sds) if sds else 0
         name = {"kr": "한국", "us": "미국"}[mk]
         res = scan(pp, mk)
         series[name] = (res, c, "-")
@@ -219,13 +308,23 @@ def main() -> int:
                       f"(n={b['n']}) · +5% {res[5]['mean']:+.2f}%/{res[5]['win']:.0f}%", flush=True)
         grids[nm] = (M, len(pp))
     hp = heat(grids, "tp_heat.png") if grids else None
+    rp, rcap = rules_chart(PP, paper_actual(os.path.join(os.path.dirname(a.kr) or "state", "paper_book.json")),
+                           "tp_rules.png")
+    print(rcap)
     if a.send and os.environ.get("TELEGRAM_TOKEN"):
+        import requests
+        with open(rp, "rb") as f:
+            requests.post(f"https://api.telegram.org/bot{os.environ['TELEGRAM_TOKEN']}/sendPhoto", timeout=60,
+                          data={"chat_id": os.environ["TELEGRAM_CHAT_ID"], "caption": rcap[:1000]}, files={"photo": f})
+    if a.send and os.environ.get("TELEGRAM_TOKEN") and not a.daily:
         import requests
         with open(out, "rb") as f:
             r = requests.post(f"https://api.telegram.org/bot{os.environ['TELEGRAM_TOKEN']}/sendPhoto", timeout=60,
                               data={"chat_id": os.environ["TELEGRAM_CHAT_ID"],
                                     "caption": "📐 익절 수준 스캔\n" + "\n".join(notes)}, files={"photo": f})
         print(f"전송 HTTP {r.status_code}")
+    if a.send and os.environ.get("TELEGRAM_TOKEN"):
+        import requests
         if hp:
             with open(hp, "rb") as f:
                 requests.post(f"https://api.telegram.org/bot{os.environ['TELEGRAM_TOKEN']}/sendPhoto", timeout=60,

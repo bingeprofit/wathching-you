@@ -114,7 +114,7 @@ jobs:
           ROUND_TRIP_PCT:   "0.55"
           # 익절 수준을 여러 개 동시에 시뮬레이션한다. 0 은 익절 없이
           # T+5·손절만 쓰는 기준선. 손절선은 실제 운용과 같은 값을 쓴다.
-          TP_GRID:          "0,3,5,8,12"
+          TP_GRID:          "0,3,5,8,12,15"
           STOP_SD:          "1.5"
           HOLD_DAYS:        "5"
           STATE_DIR:        "state"
@@ -180,7 +180,7 @@ jobs:
           ROUND_TRIP_PCT:   "0.25"
           # 익절 수준을 여러 개 동시에 시뮬레이션한다. 0 은 익절 없이
           # T+5·손절만 쓰는 기준선. 손절선은 실제 운용과 같은 값을 쓴다.
-          TP_GRID:          "0,3,5,8,12"
+          TP_GRID:          "0,3,5,8,12,15"
           STOP_SD:          "1.5"
           HOLD_DAYS:        "5"
           STATE_DIR:        "state"
@@ -199,6 +199,18 @@ jobs:
           pip install -q matplotlib
           python review_chart.py --kr state_kr/signals.jsonl --us state/signals.jsonl --send \
             || { echo "::warning title=비교 차트 실패::review_chart.py 오류 — 텍스트 집계는 정상 발송"; exit 1; }
+
+      # 익절·손절 규칙 비교 (이전 +5% vs 지금 +15%, 손절 1~3σ·없음) + 조합 히트맵 + 모의계좌 실제 청산
+      - name: 익절·손절 규칙 비교
+        continue-on-error: true
+        env:
+          TELEGRAM_TOKEN:   ${{ secrets.TELEGRAM_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          KIS_APP_KEY:      ${{ secrets.KIS_APP_KEY }}
+          KIS_APP_SECRET:   ${{ secrets.KIS_APP_SECRET }}
+        run: |
+          python tp_scan.py --daily --kr state_kr/signals.jsonl --us state/signals.jsonl --send \
+            || { echo "::warning title=규칙 비교 실패::tp_scan.py 오류"; exit 1; }
 
   # 수동 실행 only=tp: 익절 수준 스캔 (0·2·3·4·5·6·7·8·10·12·15·20·25·30%) — 한국·미국 상승 급변, 텔레그램 차트
   tp_scan:
