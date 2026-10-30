@@ -1010,6 +1010,9 @@ def check_exits(pk: "PaperKIS", bk: dict, price_fn, cfg: dict, log=print,
             log(f"장부에만 있던 포지션 정리: {p.get('name', code)} (잔고에 없음)")
             bk.setdefault("closed", []).append(
                 {**p, "_code": code, "exit_reason": "잔고불일치", "exit_ts": int(now_ts)})
+            # 예전엔 로그에만 남아 '산 줄 알았던 종목' 이 조용히 사라졌다 → 텔레그램으로 알린다
+            msgs.append(f"⚠️ *{p.get('name', code)}* 매수가 체결되지 않았습니다 — 주문 접수 후 "
+                        f"{age / 60:.0f}분 동안 잔고에 없어 장부에서 지웠습니다 (청산 시도 안 함)")
 
         msgs += adopt_orphans(pk, bk, bal, cfg, log, bars_fn)
 
@@ -1060,6 +1063,10 @@ def check_exits(pk: "PaperKIS", bk: dict, price_fn, cfg: dict, log=print,
         # 보유일은 **실제 일봉 개수**로 센다. 주중 일수로 세면 연휴가 낀 구간에서
         # 휴장일까지 경과일로 쳐서 시간청산이 일찍 나가고, 일봉으로 재현하는
         # backfill 과 숫자가 어긋난다 (2026 추석: 라이브 3거래일 vs 시뮬 5거래일).
+        # 잔고에 아직 없는 포지션(접수 후 체결 대기)은 팔 것이 없다. 예전엔 여기서 손절 주문을 내
+        # '모의투자 잔고내역이 없습니다(40240000)' 가 매분 반복됐다 (10/30 ACE 아시아TOP50).
+        if bal is not None and code not in bal:
+            continue
         held, exact = held_days(code, p.get("entry_date", ""), bars_fn,
                                 bk.setdefault("held_cache", {}), log)
         if not exact and not bk.get("_warned_inexact"):
@@ -1096,10 +1103,24 @@ def check_exits(pk: "PaperKIS", bk: dict, price_fn, cfg: dict, log=print,
         pk.last_err = ""
         o = pk.order(code, sell_q, "sell")
         if not o:
-            log(f"{p.get('name', code)} {reason} 주문 실패 — 다음 회차에 다시 시도합니다"
-                + (f" ({pk.last_err})" if pk.last_err else ""))
-            msgs.append(f"⚠️ *{p.get('name', code)}* {reason} 주문이 실패했습니다 "
-                        f"— 다음 회차에 다시 시도합니다\n{pk.last_err}")
+            err = pk.last_err or ""
+            log(f"{p.get('name', code)} {reason} 주문 실패" + (f" ({err})" if err else ""))
+            # 잔고가 없다는 거절 = 애초에 매수가 체결되지 않은 포지션. 다시 시도해도 같다 → 장부에서 정리
+            if "40240000" in err or "잔고내역이 없" in err:
+                bal2 = pk.balance()
+                if bal2 is not None and code not in bal2:
+                    pos.pop(code, None)
+                    bk.setdefault("closed", []).append(
+                        {**p, "_code": code, "exit_reason": "매수 미체결(잔고 없음)", "exit_ts": int(time.time())})
+                    msgs.append(f"⚠️ *{p.get('name', code)}* {reason} 대상이었지만 잔고에 없습니다 — "
+                                f"매수가 체결되지 않은 것으로 보고 장부에서 지웠습니다 (재시도 안 함)")
+                    continue
+            # 같은 실패를 매분 알리지 않는다 — 첫 실패와 30분마다 한 번
+            last = float(p.get("_fail_note_ts") or 0)
+            if time.time() - last >= 1800:
+                p["_fail_note_ts"] = time.time()
+                msgs.append(f"⚠️ *{p.get('name', code)}* {reason} 주문이 실패했습니다 "
+                            f"— 다음 회차에 계속 시도합니다 (같은 알림은 30분에 한 번)\n{err}")
             continue
         ret = (px / ent - 1) * 100 if (ent and px) else float("nan")
         # 왕복 거래비용: 증권거래세 0.15% + 수수료·슬리피지 가정. 모의투자는

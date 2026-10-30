@@ -1491,6 +1491,12 @@ def paper_pump(market: str) -> None:
     P.save_book(STATE_DIR, bk, log)
 
 
+_KR_ETF = re.compile(r"^(KODEX|TIGER|ACE|RISE|KBSTAR|SOL|HANARO|KOSEF|ARIRANG|PLUS|KIWOOM|1Q|TIME|WON|BNK|ITF|"
+                     r"TRUSTON|HK|KoAct|DAISHIN343|마이티|히어로즈|FOCUS|UNICORN|VITA|TREX|파워|에셋플러스|"
+                     r"마이다스|KTOP|SMART|TRUE|QV|신한|미래에셋|삼성|N2|하나)\s|\bETN\b|\bETF\b|레버리지|인버스|선물",
+                     re.I)
+
+
 def paper_auto(P, pk, bk: dict, buy: list[dict], market: str) -> list[str]:
     """상승 급변 알림과 동시에 모의계좌로 바로 주문 (버튼 승인과 같은 검사를 그대로 거친다:
     보유 중·보유 상한·상한가·현금·체결 확인). 결과 문장 목록을 돌려준다."""
@@ -1499,6 +1505,8 @@ def paper_auto(P, pk, bk: dict, buy: list[dict], market: str) -> list[str]:
     bars_fn = (lambda c: api.daily(c, 40)) if api else None
     approve = P.make_approver(pk, bk, price_fn, CFG, paper_log(bk), bars_fn=bars_fn)
     buy = [p for p in buy if p["ticker"] not in (bk.get("positions") or {})]   # 재알림은 조용히 건너뜀
+    # ETF·ETN 은 모의 자동주문에서 뺀다 (신호 검증 대상은 개별 종목, 10/30 ACE 아시아TOP50 주문이 체결 안 됨)
+    buy = [p for p in buy if not _KR_ETF.search(str(p.get("name") or ""))]
     if not buy:
         return []
     ts = P.offer(bk, buy, market)
