@@ -1511,11 +1511,23 @@ def paper_auto(P, pk, bk: dict, buy: list[dict], market: str) -> list[str]:
         return []
     ts = P.offer(bk, buy, market)
     out = []
+    today = dt.datetime.now(KST).strftime("%Y%m%d")
     for p in buy:
         try:
-            out.append(approve(f"b|{p['ticker']}|{ts}", "auto"))
+            m = approve(f"b|{p['ticker']}|{ts}", "auto")
         except Exception as e:
             log(f"자동주문 실패: {type(e).__name__} {str(e)[:100]}")
+            continue
+        # 현금 부족·보유 한도는 신호마다 같은 말이 반복된다 → 하루 한 번만 알리고 나머지는 로그로
+        kind = "cash" if m.startswith("💸") else "cap" if m.startswith("동시 보유 한도") else ""
+        if kind:
+            note = bk.setdefault("_notes", {})
+            if note.get(kind) == today:
+                log("자동주문 건너뜀(" + ("현금 부족" if kind == "cash" else "보유 한도") + ")")
+                continue
+            note[kind] = today
+            m += "\n(오늘은 같은 사유로 건너뛰는 주문을 더 알리지 않습니다)"
+        out.append(m)
     return out
 
 

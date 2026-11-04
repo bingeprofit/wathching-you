@@ -419,20 +419,25 @@ class PaperKIS:
                 "CTX_AREA_FK100": "", "CTX_AREA_NK100": ""}
 
     def _bal_raw(self, ofl: str, prod: str | None = None, quiet: bool = False,
-                 _retry: int = 0):
-        """(응답 dict 또는 None, 오류코드). 진단용으로 오류코드를 함께 돌려준다."""
+                 _retry: int = 0, fk: str = "", nk: str = ""):
+        """(응답 dict 또는 None, 오류코드). 진단용으로 오류코드를 함께 돌려준다.
+        fk/nk 를 주면 다음 쪽(연속조회). 응답 헤더 tr_cont 를 j['_tr_cont'] 에 실어 돌려준다."""
         try:
+            params = self._bal_params(ofl, prod)
+            params.update(CTX_AREA_FK100=fk, CTX_AREA_NK100=nk)
             r = http("get", f"{PAPER_BASE}/uapi/domestic-stock/v1/trading/inquire-balance",
-                             timeout=20, params=self._bal_params(ofl, prod),
-                             headers=self._headers(TR_BAL))
+                             timeout=20, params=params,
+                             headers=self._headers(TR_BAL, {"tr_cont": "N"} if (fk or nk) else None))
             j = r.json()
+            if isinstance(j, dict):
+                j["_tr_cont"] = str(r.headers.get("tr_cont") or "").strip()
         except Exception as e:
             # 개장 직후 KIS 가 자주 끊는다. 한 번은 다시 물어본다 — 여기서
             # 포기하면 그 회차의 청산 점검이 통째로 비고, 손절선을 넘긴
             # 포지션이 방치된다.
             if _retry < 1:
                 time.sleep(0.5)
-                return self._bal_raw(ofl, prod, quiet, _retry + 1)
+                return self._bal_raw(ofl, prod, quiet, _retry + 1, fk, nk)
             self.log(f"모의 잔고조회 통신 실패: {type(e).__name__} {str(e)[:120]}")
             return None, "NET"
         if r.status_code != 200 or str(j.get("rt_cd", "1")) != "0":
@@ -441,12 +446,12 @@ class PaperKIS:
             # 멀쩡한 조합을 틀렸다고 판단해 버린다.
             if code == "EGW00201" and _retry < 2:
                 time.sleep(1.0 * (_retry + 1))
-                return self._bal_raw(ofl, prod, quiet, _retry + 1)
+                return self._bal_raw(ofl, prod, quiet, _retry + 1, fk, nk)
             # 토큰이 죽었으면 버리고 한 번 다시 받는다. 캐시가 남아 있는 한
             # 몇 번을 돌려도 같은 오류만 반복된다.
             if code in TOKEN_DEAD and _retry < 1:
                 self._clear_token()
-                return self._bal_raw(ofl, prod, quiet, _retry + 1)
+                return self._bal_raw(ofl, prod, quiet, _retry + 1, fk, nk)
             if not quiet:
                 self._fail("잔고조회", r, j)
             msg = str(j.get("msg1") or "").strip()[:60]
@@ -492,8 +497,22 @@ class PaperKIS:
                 break
         if j is None:
             return None
+        # 모의투자 잔고조회는 한 번에 20종목까지만 준다 (실전 50). 보유가 그보다 많으면 연속조회로
+        # 나머지 쪽을 받아야 한다 — 예전엔 첫 쪽만 읽어서 21번째부터는 '잔고에 없음' 으로 보였고,
+        # 장부에서 지웠다가(미체결 알림) 다시 편입(장부에 없는 보유종목)하는 반복이 났다 (11/3~4 KB금융).
+        rows = list(j.get("output1") or [])
+        page = 1
+        while str(j.get("_tr_cont") or "") in ("M", "F") and page < 15:
+            fk, nk = str(j.get("ctx_area_fk100") or ""), str(j.get("ctx_area_nk100") or "")
+            if not (fk or nk):
+                break
+            j, _ = self._bal_raw(self._bal_ofl or "", quiet=True, fk=fk, nk=nk)
+            if j is None:
+                return None                      # 일부만 받은 잔고를 전체로 읽으면 안 된다 → '모름'
+            rows += list(j.get("output1") or [])
+            page += 1
         out = {}
-        for x in (j.get("output1") or []):
+        for x in rows:
             q = _f(x, "hldg_qty")
             if q > 0:
                 out[str(x.get("pdno") or "").zfill(6)] = {
@@ -1006,13 +1025,24 @@ def check_exits(pk: "PaperKIS", bk: dict, price_fn, cfg: dict, log=print,
                 log(f"{pos[code].get('name', code)} 아직 잔고 미반영 "
                     f"({age:.0f}초 경과) — 체결 대기로 보고 유지")
                 continue
+            # 잔고에 없다고 바로 지우지 않는다 — 체결내역으로 매수가 실제로 체결됐는지 먼저 본다.
+            # 체결 기록이 있으면(또는 조회 실패면) 잔고 조회 쪽 문제로 보고 유지한다.
+            p0 = pos[code]
+            since = str(p0.get("entry_date") or dt.datetime.now(KST).strftime("%Y%m%d"))
+            rows = pk._ccld(since, dt.datetime.now(KST).strftime("%Y%m%d"), code=code, side="buy", ccld="01")
+            filled = None if rows is None else sum(
+                _f(o, "tot_ccld_qty") for o in rows if str(o.get("pdno") or "").zfill(6) == str(code).zfill(6))
+            if filled is None or filled > 0:
+                p0["_miss"] = int(p0.get("_miss") or 0) + 1
+                log(f"{p0.get('name', code)} 잔고 조회에 안 보임 ({p0['_miss']}회) — "
+                    + ("체결조회 실패" if filled is None else f"체결 기록 {filled:,.0f}주 있음") + " → 유지")
+                continue
             p = pos.pop(code)
-            log(f"장부에만 있던 포지션 정리: {p.get('name', code)} (잔고에 없음)")
+            log(f"장부에만 있던 포지션 정리: {p.get('name', code)} (잔고·체결 기록 모두 없음)")
             bk.setdefault("closed", []).append(
-                {**p, "_code": code, "exit_reason": "잔고불일치", "exit_ts": int(now_ts)})
-            # 예전엔 로그에만 남아 '산 줄 알았던 종목' 이 조용히 사라졌다 → 텔레그램으로 알린다
-            msgs.append(f"⚠️ *{p.get('name', code)}* 매수가 체결되지 않았습니다 — 주문 접수 후 "
-                        f"{age / 60:.0f}분 동안 잔고에 없어 장부에서 지웠습니다 (청산 시도 안 함)")
+                {**p, "_code": code, "exit_reason": "매수 미체결", "exit_ts": int(now_ts)})
+            msgs.append(f"⚠️ *{p.get('name', code)}* 매수가 체결되지 않았습니다 — 잔고와 체결내역 모두 없어 "
+                        f"장부에서 지웠습니다 (주문 접수 후 {age / 60:.0f}분)")
 
         msgs += adopt_orphans(pk, bk, bal, cfg, log, bars_fn)
 
@@ -1024,6 +1054,7 @@ def check_exits(pk: "PaperKIS", bk: dict, price_fn, cfg: dict, log=print,
             b = bal.get(code)
             if not b:
                 continue
+            p.pop("_miss", None)
             if b.get("qty"):
                 p["qty"] = int(b["qty"])
             avg = float(b.get("avg") or 0.0)
