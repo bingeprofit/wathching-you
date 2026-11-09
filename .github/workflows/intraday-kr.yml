@@ -83,13 +83,38 @@ jobs:
           SLOT: ${{ github.event.schedule }}
         run: |
           wf=$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" --jq .workflow_id) || wf=""
-          since=$(date -u -d '-8 hours' +%Y-%m-%dT%H:%M:%SZ)
+          # 이 cron 의 '직전 예약 시각'(지금 이전 마지막 발화) 이후에 VM 정시 실행이 있었는지 본다.
+          # 예전엔 '최근 8시간'이었는데 GitHub 백업 예약이 8시간 넘게 늦은 날 중복 발송이 났다 (2026-11-09 신호 집계).
+          since=$(python3 - "$SLOT" <<'PY' || date -u -d '-8 hours' +%Y-%m-%dT%H:%M:%SZ
+          import sys, datetime as d
+          def ex(f, lo, hi):
+              s = set()
+              for p in f.split(","):
+                  st = 1
+                  if "/" in p:
+                      p, st = p.split("/"); st = int(st)
+                  a, b = (lo, hi) if p == "*" else (map(int, p.split("-")) if "-" in p else (int(p), int(p)))
+                  s.update(range(a, b + 1, st))
+              return s
+          m, h, dom, mon, dow = sys.argv[1].split()
+          M, H, D, MO = ex(m, 0, 59), ex(h, 0, 23), ex(dom, 1, 31), ex(mon, 1, 12)
+          W = {x % 7 for x in ex(dow, 0, 7)}
+          t = d.datetime.now(d.timezone.utc).replace(second=0, microsecond=0)
+          for _ in range(60 * 24 * 8):
+              dd, ww = t.day in D, t.isoweekday() % 7 in W
+              day = (dd or ww) if (dom != "*" and dow != "*") else (dd and ww)
+              if t.minute in M and t.hour in H and t.month in MO and day:
+                  break
+              t -= d.timedelta(minutes=1)
+          print((t - d.timedelta(minutes=2)).strftime("%Y-%m-%dT%H:%M:%SZ"))
+          PY
+          )
           n=0
           if [ -n "$wf" ]; then
             n=$(gh api "repos/$GITHUB_REPOSITORY/actions/workflows/$wf/runs?event=workflow_dispatch&created=%3E%3D$since&per_page=100" \
                   --jq "[.workflow_runs[] | select(.display_title | endswith(\"⏰[$SLOT]\"))] | length") || n=0
           fi
-          echo "최근 8시간 VM 정시 실행 [$SLOT]: ${n:-0}건"
+          echo "직전 예약 시각($since) 이후 VM 정시 실행 [$SLOT]: ${n:-0}건"
           if [ "${n:-0}" -gt 0 ]; then
             echo "skip=1" >> "$GITHUB_OUTPUT"
             echo "::notice title=백업 예약 건너뜀::VM 이 이미 정시에 실행함 [$SLOT]"
