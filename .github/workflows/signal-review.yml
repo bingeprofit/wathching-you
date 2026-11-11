@@ -176,7 +176,7 @@ jobs:
       - name: 한국 기록 옮기기
         run: |
           if [ -d state ]; then mv state state_kr; fi
-          (sudo apt-get update -qq && sudo apt-get install -y -qq fonts-nanum) >/dev/null 2>&1 || true
+          bash .github/install_fonts.sh      # apt 실패 시 google/fonts 에서 직접
 
       # 장중 잡과 같은 path(state)·같은 접두어라야 복원된다. 채운 결과는 새 키로
       # 저장되고, 다음 장중 잡이 그걸(가장 최신) 이어받는다.
@@ -251,7 +251,7 @@ jobs:
           cache: pip
       - run: |
           pip install -q -r requirements.txt matplotlib
-          (sudo apt-get update -qq && sudo apt-get install -y -qq fonts-nanum) >/dev/null 2>&1 || true
+          bash .github/install_fonts.sh      # apt 실패 시 google/fonts 에서 직접
       - uses: actions/cache/restore@v4
         with:
           path: state
