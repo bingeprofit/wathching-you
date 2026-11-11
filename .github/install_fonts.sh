@@ -6,13 +6,11 @@ set -u
 D=/usr/share/fonts/truetype/nanum
 have() { [ -s "$D/NanumGothic.ttf" ]; }
 have && exit 0
-A="-o Acquire::Retries=3 -o DPkg::Lock::Timeout=60"
-for i in 1 2; do
-  sudo apt-get install -y -qq $A fonts-nanum >/dev/null 2>&1 && have && exit 0
-  sudo apt-get update -qq $A >/dev/null 2>&1 || true
-  sudo apt-get install -y -qq $A fonts-nanum >/dev/null 2>&1 && have && exit 0
-  sleep 15
-done
+# 미러가 '응답 없음'으로 걸리면 apt 가 수십 분 매달린다 (2026-11-12 재실행에서 15분+) → 단계마다 timeout 으로 자른다.
+A="-o Acquire::Retries=2 -o Acquire::http::Timeout=20 -o Acquire::https::Timeout=20 -o DPkg::Lock::Timeout=60"
+timeout 120 sudo apt-get install -y -qq $A fonts-nanum >/dev/null 2>&1 && have && exit 0
+timeout 180 sudo apt-get update -qq $A >/dev/null 2>&1 || true
+timeout 120 sudo apt-get install -y -qq $A fonts-nanum >/dev/null 2>&1 && have && exit 0
 echo "apt fonts-nanum 실패 → google/fonts 에서 직접 받음"
 U=https://raw.githubusercontent.com/google/fonts/main/ofl/nanumgothic
 sudo mkdir -p "$D"
